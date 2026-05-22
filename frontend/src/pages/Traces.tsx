@@ -35,7 +35,7 @@ export default function Traces() {
   });
 
   const traces = useMemo<TraceListItemView[]>(() => {
-    const items = tracesQuery.data?.data.data ?? [];
+    const items = tracesQuery.data?.data ?? [];
     return items.map((trace) => {
       const tokenInput = null;
       const tokenOutput = null;
@@ -49,7 +49,7 @@ export default function Traces() {
     });
   }, [tracesQuery.data]);
 
-  const selectedTrace = traceDetailQuery.data?.data ?? null;
+  const selectedTrace = traceDetailQuery.data ?? null;
 
   return (
     <AppLayout>

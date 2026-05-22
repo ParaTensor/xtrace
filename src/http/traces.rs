@@ -261,10 +261,11 @@ SELECT
   t.total_cost,
   t.created_at,
   t.updated_at,
-  COALESCE(array_agg(o.id) FILTER (WHERE o.id IS NOT NULL), '{}') AS observations
-FROM traces t
-LEFT JOIN observations o ON o.trace_id = t.id
-WHERE 1=1
+  COALESCE((SELECT array_agg(id) FROM observations WHERE trace_id = t.id), '{}') AS observations
+FROM (
+  SELECT *
+  FROM traces t
+  WHERE 1=1
         "#,
     );
 
@@ -272,7 +273,6 @@ WHERE 1=1
     builder.push_bind(state.default_project_id.to_string());
 
     apply_trace_filters(&mut builder, &q);
-    builder.push(" GROUP BY t.id");
 
     builder.push(" ORDER BY ");
     builder.push(order_column);
@@ -281,6 +281,8 @@ WHERE 1=1
     builder.push_bind(limit);
     builder.push(" OFFSET ");
     builder.push_bind(offset);
+
+    builder.push(") t");
 
     let rows: Vec<TraceListRow> = builder.build_query_as().fetch_all(&state.pool).await?;
 

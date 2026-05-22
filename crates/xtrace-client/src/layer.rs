@@ -116,11 +116,9 @@ pub struct XtraceLayer {
 
 struct XtraceLayerInner {
     tx: mpsc::SyncSender<MetricPoint>,
-    span_records: Mutex<Vec<SpanRecord>>,
 }
 
 struct SpanRecord {
-    span_id: u64,
     created_at: Instant,
     name: String,
 }
@@ -131,7 +129,6 @@ impl XtraceLayer {
         let (tx, rx) = mpsc::sync_channel(1000);
         let inner = Arc::new(XtraceLayerInner {
             tx,
-            span_records: Mutex::new(Vec::new()),
         });
 
         let client = client.clone();
@@ -225,17 +222,17 @@ where
             parent_tid.unwrap_or_else(Uuid::new_v4)
         };
 
-        // Store trace_id mapping (release lock before acquiring span_records).
+        // Store trace_id mapping.
         if let Ok(mut store) = trace_id_store().lock() {
             store.insert(key, trace_id);
         }
 
-        let mut guard = self.inner.span_records.lock().unwrap();
-        guard.push(SpanRecord {
-            span_id: key,
-            created_at: Instant::now(),
-            name,
-        });
+        if let Some(span) = ctx.span(id) {
+            span.extensions_mut().insert(SpanRecord {
+                created_at: Instant::now(),
+                name,
+            });
+        }
     }
 
     fn on_event(&self, event: &tracing::Event<'_>, ctx: Context<'_, S>) {
@@ -257,7 +254,7 @@ where
         }
     }
 
-    fn on_close(&self, id: tracing::Id, _ctx: Context<'_, S>) {
+    fn on_close(&self, id: tracing::Id, ctx: Context<'_, S>) {
         let key = id.into_u64();
 
         // Remove and read trace_id before cleanup.
@@ -267,11 +264,11 @@ where
             .and_then(|mut s| s.remove(&key));
 
         let (duration_secs, span_name) = {
-            let mut guard = self.inner.span_records.lock().unwrap();
-            let pos = guard.iter().position(|r| r.span_id == key);
-            if let Some(pos) = pos {
-                let rec = guard.remove(pos);
-                (rec.created_at.elapsed().as_secs_f64(), rec.name)
+            let opt = ctx.span(&id)
+                .and_then(|span| span.extensions_mut().remove::<SpanRecord>())
+                .map(|rec| (rec.created_at.elapsed().as_secs_f64(), rec.name));
+            if let Some(res) = opt {
+                res
             } else {
                 return;
             }

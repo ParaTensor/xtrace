@@ -67,22 +67,16 @@ export type TraceDetail = Omit<TraceListItem, "observations"> & {
 };
 
 export type TraceListResponse = {
-  message: string;
-  data: {
-    data: TraceListItem[];
-    meta: {
-      page: number;
-      limit: number;
-      totalItems: number;
-      totalPages: number;
-    };
+  data: TraceListItem[];
+  meta: {
+    page: number;
+    limit: number;
+    totalItems: number;
+    totalPages: number;
   };
 };
 
-export type TraceDetailResponse = {
-  message: string;
-  data: TraceDetail;
-};
+export type TraceDetailResponse = TraceDetail;
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:8742";
 
