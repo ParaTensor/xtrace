@@ -4,6 +4,34 @@ xtrace is a lightweight, self-hosted observability backend for AI/LLM applicatio
 
 ## Running
 
+`xtrace` supports two storage backends:
+1. **In-Memory & JSON Persistence (PostgreSQL-Free)**: Zero-dependency mode. Ideal for lightweight edge deployments (like Kunpeng/openEuler) and quick development tests.
+2. **PostgreSQL**: Production-grade database persistence.
+
+### Option 1: In-Memory & JSON Persistence (PostgreSQL-Free)
+
+In this mode, `xtrace` runs with **zero dependencies**. It stores all data in memory and automatically persists it to local JSON files.
+
+To run:
+```bash
+# Start with default settings (API token defaults to "xtrace-default-token", files saved to "./.xtrace_data")
+XTRACE_MOCK_STORAGE=true ./xtrace
+
+# Or customize the storage directory and port
+XTRACE_JSON_DIR=/var/lib/xtrace-data BIND_ADDR=0.0.0.0:8742 ./xtrace
+```
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `XTRACE_MOCK_STORAGE` | | `false` | Set to `true` to run without PostgreSQL |
+| `XTRACE_JSON_DIR` | | `./.xtrace_data` | Directory where trace/observation/metric JSON files are persisted. Specifying this also enables mock storage automatically. |
+| `API_BEARER_TOKEN` | | `xtrace-default-token` | Secret bearer token. Optional in mock mode. |
+| `BIND_ADDR` | | `127.0.0.1:8742` | Listen address |
+
+---
+
+### Option 2: PostgreSQL (Production Default)
+
 Dependencies: PostgreSQL.
 
 Environment variables:
