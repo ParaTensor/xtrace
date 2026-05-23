@@ -3,7 +3,14 @@ use sqlx::PgPool;
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::Mutex;
 use tokio::sync::mpsc;
+use uuid::Uuid;
+use chrono::{DateTime, Utc};
+use serde::{Serialize, Deserialize};
+use serde_json::Value as JsonValue;
+use dashmap::DashMap;
 
 use crate::{http::metrics::MetricsBatchRequest, ingest::batch::BatchIngestRequest};
 
@@ -121,7 +128,7 @@ pub struct ServerConfig {
 
 #[derive(Clone)]
 pub struct AppState {
-    pub pool: PgPool,
+    pub db: DatabaseConnection,
     pub api_bearer_token: Arc<str>,
     pub langfuse_public_key: Option<Arc<str>>,
     pub langfuse_secret_key: Option<Arc<str>>,
@@ -141,5 +148,179 @@ impl AppState {
         let quota = Quota::per_second(NonZeroU32::new(qps).expect("rate_limit_qps must be > 0"))
             .allow_burst(NonZeroU32::new(burst).expect("rate_limit_burst must be > 0"));
         Arc::new(KeyedRateLimiter::keyed(quota))
+    }
+}
+
+#[derive(Clone)]
+pub enum DatabaseConnection {
+    Postgres(PgPool),
+    Memory(Arc<MemoryDb>),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct TraceRow {
+    pub id: Uuid,
+    pub timestamp: DateTime<Utc>,
+    pub name: Option<String>,
+    pub input: Option<JsonValue>,
+    pub output: Option<JsonValue>,
+    pub session_id: Option<String>,
+    pub release: Option<String>,
+    pub version: Option<String>,
+    pub user_id: Option<String>,
+    pub metadata: Option<JsonValue>,
+    pub tags: Vec<String>,
+    pub public: bool,
+    pub environment: String,
+    pub latency: Option<f64>,
+    pub total_cost: Option<f64>,
+    pub external_id: Option<String>,
+    pub bookmarked: bool,
+    pub project_id: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ObservationRow {
+    pub id: Uuid,
+    pub trace_id: Uuid,
+    pub r#type: String,
+    pub name: Option<String>,
+    pub start_time: Option<DateTime<Utc>>,
+    pub end_time: Option<DateTime<Utc>>,
+    pub completion_start_time: Option<DateTime<Utc>>,
+    pub model: Option<String>,
+    pub model_parameters: Option<JsonValue>,
+    pub input: Option<JsonValue>,
+    pub output: Option<JsonValue>,
+    pub usage: Option<JsonValue>,
+    pub level: Option<String>,
+    pub status_message: Option<String>,
+    pub parent_observation_id: Option<Uuid>,
+    pub prompt_id: Option<String>,
+    pub prompt_name: Option<String>,
+    pub prompt_version: Option<String>,
+    pub model_id: Option<String>,
+    pub input_price: Option<f64>,
+    pub output_price: Option<f64>,
+    pub total_price: Option<f64>,
+    pub calculated_input_cost: Option<f64>,
+    pub calculated_output_cost: Option<f64>,
+    pub calculated_total_cost: Option<f64>,
+    pub latency: Option<f64>,
+    pub time_to_first_token: Option<f64>,
+    pub completion_tokens: Option<i64>,
+    pub prompt_tokens: Option<i64>,
+    pub total_tokens: Option<i64>,
+    pub unit: Option<String>,
+    pub metadata: Option<JsonValue>,
+    pub environment: String,
+    pub project_id: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct MetricRow {
+    pub project_id: String,
+    pub environment: String,
+    pub name: String,
+    pub labels: serde_json::Value,
+    pub value: f64,
+    pub timestamp: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+}
+
+pub struct MemoryDb {
+    pub traces: DashMap<Uuid, TraceRow>,
+    pub observations: DashMap<Uuid, ObservationRow>,
+    pub metrics: Mutex<Vec<MetricRow>>,
+    pub data_dir: Option<PathBuf>,
+}
+
+impl MemoryDb {
+    pub fn new(data_dir: Option<PathBuf>) -> Self {
+        let db = Self {
+            traces: DashMap::new(),
+            observations: DashMap::new(),
+            metrics: Mutex::new(Vec::new()),
+            data_dir,
+        };
+        db.load();
+        db
+    }
+
+    fn load(&self) {
+        let Some(ref dir) = self.data_dir else { return; };
+        
+        let traces_path = dir.join("traces.json");
+        if traces_path.exists() {
+            if let Ok(file) = std::fs::File::open(&traces_path) {
+                if let Ok(data) = serde_json::from_reader::<_, Vec<TraceRow>>(file) {
+                    for r in data {
+                        self.traces.insert(r.id, r);
+                    }
+                }
+            }
+        }
+        
+        let obs_path = dir.join("observations.json");
+        if obs_path.exists() {
+            if let Ok(file) = std::fs::File::open(&obs_path) {
+                if let Ok(data) = serde_json::from_reader::<_, Vec<ObservationRow>>(file) {
+                    for r in data {
+                        self.observations.insert(r.id, r);
+                    }
+                }
+            }
+        }
+        
+        let metrics_path = dir.join("metrics.json");
+        if metrics_path.exists() {
+            if let Ok(file) = std::fs::File::open(&metrics_path) {
+                if let Ok(data) = serde_json::from_reader::<_, Vec<MetricRow>>(file) {
+                    if let Ok(mut m) = self.metrics.lock() {
+                        *m = data;
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn save(&self) {
+        let Some(ref dir) = self.data_dir else { return; };
+        let _ = std::fs::create_dir_all(dir);
+        
+        let traces_path = dir.join("traces.json");
+        if let Ok(file) = std::fs::File::create(&traces_path) {
+            let data: Vec<TraceRow> = self.traces.iter().map(|item| item.value().clone()).collect();
+            let _ = serde_json::to_writer_pretty(file, &data);
+        }
+
+        let obs_path = dir.join("observations.json");
+        if let Ok(file) = std::fs::File::create(&obs_path) {
+            let data: Vec<ObservationRow> = self.observations.iter().map(|item| item.value().clone()).collect();
+            let _ = serde_json::to_writer_pretty(file, &data);
+        }
+
+        let metrics_path = dir.join("metrics.json");
+        if let Ok(file) = std::fs::File::create(&metrics_path) {
+            if let Ok(m) = self.metrics.lock() {
+                let _ = serde_json::to_writer_pretty(file, &*m);
+            }
+        }
+    }
+
+    pub fn spawn_sync_loop(self: Arc<Self>) {
+        if self.data_dir.is_none() {
+            return;
+        }
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                self.save();
+            }
+        });
     }
 }

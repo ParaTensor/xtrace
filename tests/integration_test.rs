@@ -242,3 +242,228 @@ async fn metrics_overview_returns_count_and_latency() {
         .unwrap();
     assert_eq!(error_response.status(), StatusCode::OK);
 }
+
+async fn setup_mock_app() -> (axum::Router, String) {
+    let token = "mock-test-token".to_string();
+    let mem_db = std::sync::Arc::new(xtrace::state::MemoryDb::new(None));
+    let db_conn = xtrace::state::DatabaseConnection::Memory(mem_db);
+
+    let (ingest_tx, ingest_rx) = tokio::sync::mpsc::channel(1000);
+    let (metrics_tx, metrics_rx) = tokio::sync::mpsc::channel(5000);
+    let ingest_stats = std::sync::Arc::new(xtrace::state::IngestStats::new());
+    let default_project_id: std::sync::Arc<str> = std::sync::Arc::from("default");
+
+    tokio::spawn(xtrace::ingest::batch::ingest_worker(
+        db_conn.clone(),
+        default_project_id.clone(),
+        ingest_rx,
+        ingest_stats.clone(),
+    ));
+    tokio::spawn(xtrace::http::metrics::metrics_worker(
+        db_conn.clone(),
+        default_project_id.clone(),
+        metrics_rx,
+    ));
+
+    let state = xtrace::state::AppState {
+        db: db_conn,
+        api_bearer_token: std::sync::Arc::from(token.as_str()),
+        langfuse_public_key: None,
+        langfuse_secret_key: None,
+        default_project_id,
+        ingest_tx,
+        metrics_tx,
+        query_limiter: xtrace::state::AppState::build_limiter(100, 200),
+        rate_limit_stats: std::sync::Arc::new(xtrace::state::RateLimitStats::new()),
+        ingest_stats,
+        rate_limit_qps: 100,
+        rate_limit_burst: 200,
+        allow_unauthenticated_compat: false,
+    };
+
+    let router = xtrace::app::build_router(state, 20 * 1024 * 1024);
+    (router, token)
+}
+
+#[tokio::test]
+async fn in_memory_storage_integration_test() {
+    let (app, token) = setup_mock_app().await;
+    let trace_id = Uuid::new_v4();
+    let obs_id = Uuid::new_v4();
+
+    // 1. Ingest a trace and an observation
+    let ingest = authed_request(
+        "POST",
+        "/v1/l/batch",
+        &token,
+        Some(json!({
+            "trace": {
+                "id": trace_id,
+                "timestamp": Utc::now(),
+                "name": "in-memory-test",
+                "userId": "bob",
+                "tags": ["mem-tag"]
+            },
+            "observations": [{
+                "id": obs_id,
+                "traceId": trace_id,
+                "type": "GENERATION",
+                "name": "llm-mock",
+                "startTime": Utc::now(),
+                "endTime": Utc::now(),
+                "model": "llama-3",
+                "input": {"prompt": "ping"},
+                "output": {"response": "pong"},
+                "level": "ERROR",
+                "statusMessage": "Failed intentionally"
+            }]
+        })),
+    );
+
+    let ingest_response = app.clone().oneshot(ingest).await.unwrap();
+    assert_eq!(ingest_response.status(), StatusCode::OK);
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // 2. Fetch trace list
+    let list_response = app
+        .clone()
+        .oneshot(authed_request(
+            "GET",
+            "/api/public/traces?page=1&limit=10&fields=io,observations,metrics",
+            &token,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(list_response.status(), StatusCode::OK);
+    let body_bytes = axum::body::to_bytes(list_response.into_body(), usize::MAX).await.unwrap();
+    let list_data: Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(list_data["data"].as_array().unwrap().len(), 1);
+    assert_eq!(list_data["data"][0]["name"].as_str(), Some("in-memory-test"));
+
+    // 3. Fetch trace detail
+    let detail_response = app
+        .clone()
+        .oneshot(authed_request(
+            "GET",
+            &format!("/api/public/traces/{trace_id}"),
+            &token,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(detail_response.status(), StatusCode::OK);
+    let detail_bytes = axum::body::to_bytes(detail_response.into_body(), usize::MAX).await.unwrap();
+    let detail_data: Value = serde_json::from_slice(&detail_bytes).unwrap();
+    assert_eq!(detail_data["name"].as_str(), Some("in-memory-test"));
+    assert_eq!(detail_data["observations"].as_array().unwrap().len(), 1);
+    assert_eq!(detail_data["observations"][0]["name"].as_str(), Some("llm-mock"));
+
+    // 4. Ingest a metric point
+    let write_response = app
+        .clone()
+        .oneshot(authed_request(
+            "POST",
+            "/v1/metrics/batch",
+            &token,
+            Some(json!({
+                "metrics": [{
+                    "name": "cpu_load",
+                    "labels": {"host": "localhost"},
+                    "value": 75.0,
+                    "timestamp": Utc::now()
+                }]
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(write_response.status(), StatusCode::OK);
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // 5. Query metrics names
+    let names_response = app
+        .clone()
+        .oneshot(authed_request(
+            "GET",
+            "/api/public/metrics/names",
+            &token,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(names_response.status(), StatusCode::OK);
+    let names_bytes = axum::body::to_bytes(names_response.into_body(), usize::MAX).await.unwrap();
+    let names_data: Value = serde_json::from_slice(&names_bytes).unwrap();
+    assert!(names_data["data"].as_array().unwrap().iter().any(|v| v.as_str() == Some("cpu_load")));
+
+    // 6. Query metrics values
+    let query_response = app
+        .clone()
+        .oneshot(authed_request(
+            "GET",
+            "/api/public/metrics/query?name=cpu_load&step=1m&agg=avg",
+            &token,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(query_response.status(), StatusCode::OK);
+    let query_bytes = axum::body::to_bytes(query_response.into_body(), usize::MAX).await.unwrap();
+    let query_data: Value = serde_json::from_slice(&query_bytes).unwrap();
+    assert_eq!(query_data["data"].as_array().unwrap().len(), 1);
+    assert_eq!(query_data["data"][0]["values"].as_array().unwrap().len(), 1);
+    assert_eq!(query_data["data"][0]["values"][0]["value"].as_f64(), Some(75.0));
+
+    // 7. Query daily metrics
+    let daily_response = app
+        .clone()
+        .oneshot(authed_request(
+            "GET",
+            "/api/public/metrics/daily",
+            &token,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(daily_response.status(), StatusCode::OK);
+    let daily_bytes = axum::body::to_bytes(daily_response.into_body(), usize::MAX).await.unwrap();
+    let daily_data: Value = serde_json::from_slice(&daily_bytes).unwrap();
+    assert_eq!(daily_data["data"].as_array().unwrap().len(), 1);
+    assert_eq!(daily_data["data"][0]["countTraces"].as_i64(), Some(1));
+
+    // 8. Query overview with traces view and observations view
+    let query_param = json!({
+        "view": "traces",
+        "fromTimestamp": "2000-01-01T00:00:00Z",
+        "toTimestamp": "3000-01-01T00:00:00Z",
+        "metrics": [{"measure": "count", "aggregation": "count"}]
+    });
+    let uri = format!("/api/public/metrics?query={}", url_encode_json(&query_param));
+    let response = app
+        .clone()
+        .oneshot(authed_request("GET", &uri, &token, None))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let overview_bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let overview_data: Value = serde_json::from_slice(&overview_bytes).unwrap();
+    assert_eq!(overview_data["data"][0]["count_count"].as_i64(), Some(1));
+
+    let error_query = json!({
+        "view": "observations",
+        "fromTimestamp": "2000-01-01T00:00:00Z",
+        "toTimestamp": "3000-01-01T00:00:00Z",
+        "filters": [{"column": "level", "value": "ERROR"}]
+    });
+    let error_uri = format!("/api/public/metrics?query={}", url_encode_json(&error_query));
+    let error_response = app
+        .oneshot(authed_request("GET", &error_uri, &token, None))
+        .await
+        .unwrap();
+    assert_eq!(error_response.status(), StatusCode::OK);
+    let error_bytes = axum::body::to_bytes(error_response.into_body(), usize::MAX).await.unwrap();
+    let error_data: Value = serde_json::from_slice(&error_bytes).unwrap();
+    assert_eq!(error_data["data"][0]["traceId"].as_str(), Some(trace_id.to_string().as_str()));
+}

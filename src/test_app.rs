@@ -28,20 +28,22 @@ pub async fn setup_test_router(
     let ingest_stats = Arc::new(IngestStats::new());
     let default_project_id: Arc<str> = Arc::from("default");
 
+    let db_conn = crate::state::DatabaseConnection::Postgres(pool);
+
     tokio::spawn(ingest_worker(
-        pool.clone(),
+        db_conn.clone(),
         default_project_id.clone(),
         ingest_rx,
         ingest_stats.clone(),
     ));
     tokio::spawn(metrics_worker(
-        pool.clone(),
+        db_conn.clone(),
         default_project_id.clone(),
         metrics_rx,
     ));
 
     let state = AppState {
-        pool,
+        db: db_conn,
         api_bearer_token: Arc::from(bearer_token),
         langfuse_public_key: None,
         langfuse_secret_key: None,

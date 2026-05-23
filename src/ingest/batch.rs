@@ -235,7 +235,7 @@ pub(crate) async fn post_batch(
 }
 
 pub(crate) async fn ingest_worker(
-    pool: PgPool,
+    db: crate::state::DatabaseConnection,
     default_project_id: Arc<str>,
     mut rx: mpsc::Receiver<BatchIngestRequest>,
     stats: Arc<IngestStats>,
@@ -267,7 +267,17 @@ pub(crate) async fn ingest_worker(
             .map(|b| b.trace.as_ref().map(|_| 1).unwrap_or(0) + b.observations.len())
             .sum::<usize>() as u64;
 
-        match write_batches(&pool, default_project_id.as_ref(), batches).await {
+        let res = match &db {
+            crate::state::DatabaseConnection::Postgres(pool) => {
+                write_batches(pool, default_project_id.as_ref(), batches).await
+                    .map_err(|e| anyhow::anyhow!(e))
+            }
+            crate::state::DatabaseConnection::Memory(mem_db) => {
+                write_batches_to_memory(mem_db, default_project_id.as_ref(), batches)
+            }
+        };
+
+        match res {
             Ok(()) => {
                 stats.record_batches_written(1);
                 stats.record_items_written(item_count);
@@ -549,5 +559,140 @@ async fn write_batches(
     }
 
     tx.commit().await?;
+    Ok(())
+}
+
+fn write_batches_to_memory(
+    mem_db: &crate::state::MemoryDb,
+    default_project_id: &str,
+    payloads: Vec<BatchIngestRequest>,
+) -> Result<(), anyhow::Error> {
+    let now = Utc::now();
+    let mut resolved_traces = Vec::new();
+    let mut resolved_obs = Vec::new();
+    let mut placeholders = HashMap::new();
+
+    for payload in payloads {
+        if let Some(trace) = payload.trace {
+            resolved_traces.push(resolve_trace(trace, default_project_id, now));
+        }
+        for obs in payload.observations {
+            let resolved = resolve_observation(obs, default_project_id);
+            placeholders
+                .entry(resolved.trace_id)
+                .or_insert((resolved.project_id.clone(), resolved.environment.clone()));
+            resolved_obs.push(resolved);
+        }
+    }
+
+    // 1. Insert placeholders
+    for (trace_id, (project_id, env)) in placeholders {
+        if !mem_db.traces.contains_key(&trace_id) {
+            let row = crate::state::TraceRow {
+                id: trace_id,
+                project_id: project_id.clone(),
+                environment: env.clone(),
+                timestamp: now,
+                name: None,
+                input: None,
+                output: None,
+                session_id: None,
+                release: None,
+                version: None,
+                user_id: None,
+                metadata: None,
+                tags: vec![],
+                public: false,
+                external_id: None,
+                bookmarked: false,
+                latency: None,
+                total_cost: None,
+                created_at: now,
+                updated_at: now,
+            };
+            mem_db.traces.insert(trace_id, row);
+        }
+    }
+
+    // 2. Upsert resolved traces
+    for t in resolved_traces {
+        let (created_at, updated_at) = if let Some(existing) = mem_db.traces.get(&t.id) {
+            (existing.created_at, now)
+        } else {
+            (now, now)
+        };
+        let row = crate::state::TraceRow {
+            id: t.id,
+            project_id: t.project_id,
+            environment: t.environment,
+            timestamp: t.timestamp,
+            name: t.name,
+            input: t.input,
+            output: t.output,
+            session_id: t.session_id,
+            release: t.release,
+            version: t.version,
+            user_id: t.user_id,
+            metadata: t.metadata,
+            tags: t.tags,
+            public: t.public,
+            external_id: t.external_id,
+            bookmarked: t.bookmarked,
+            latency: t.latency,
+            total_cost: t.total_cost,
+            created_at,
+            updated_at,
+        };
+        mem_db.traces.insert(t.id, row);
+    }
+
+    // 3. Upsert resolved observations
+    for o in resolved_obs {
+        let (created_at, updated_at) = if let Some(existing) = mem_db.observations.get(&o.id) {
+            (existing.created_at, now)
+        } else {
+            (now, now)
+        };
+        let row = crate::state::ObservationRow {
+            id: o.id,
+            trace_id: o.trace_id,
+            r#type: o.obs_type,
+            name: o.name,
+            start_time: o.start_time,
+            end_time: o.end_time,
+            completion_start_time: o.completion_start_time,
+            model: o.model,
+            model_parameters: o.model_parameters,
+            input: o.input,
+            output: o.output,
+            usage: o.usage,
+            level: o.level,
+            status_message: o.status_message,
+            parent_observation_id: o.parent_observation_id,
+            prompt_id: o.prompt_id,
+            prompt_name: o.prompt_name,
+            prompt_version: o.prompt_version,
+            model_id: o.model_id,
+            input_price: o.input_price,
+            output_price: o.output_price,
+            total_price: o.total_price,
+            calculated_input_cost: o.calculated_input_cost,
+            calculated_output_cost: o.calculated_output_cost,
+            calculated_total_cost: o.calculated_total_cost,
+            latency: o.latency,
+            time_to_first_token: o.time_to_first_token,
+            completion_tokens: o.completion_tokens,
+            prompt_tokens: o.prompt_tokens,
+            total_tokens: o.total_tokens,
+            unit: o.unit,
+            metadata: o.metadata,
+            environment: o.environment,
+            project_id: o.project_id,
+            created_at,
+            updated_at,
+        };
+        mem_db.observations.insert(o.id, row);
+    }
+
     Ok(())
 }

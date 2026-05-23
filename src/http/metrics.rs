@@ -130,17 +130,35 @@ pub(crate) async fn get_metrics_names(
 ) -> Result<impl IntoResponse, ApiError> {
     let project_id = state.default_project_id.as_ref();
 
-    let names: Vec<String> = sqlx::query_scalar(
-        r#"
+    let names: Vec<String> = match &state.db {
+        crate::state::DatabaseConnection::Postgres(pool) => {
+            sqlx::query_scalar(
+                r#"
 SELECT DISTINCT name
 FROM metrics
 WHERE project_id = $1 AND environment = 'default'
 ORDER BY name
-        "#,
-    )
-    .bind(project_id)
-    .fetch_all(&state.pool)
-    .await?;
+                "#,
+            )
+            .bind(project_id)
+            .fetch_all(pool)
+            .await?
+        }
+        crate::state::DatabaseConnection::Memory(mem_db) => {
+            let metrics_guard = mem_db
+                .metrics
+                .lock()
+                .map_err(|e| ApiError::Internal(format!("Mutex lock error: {e}")))?;
+            let mut unique_names: Vec<String> = metrics_guard
+                .iter()
+                .filter(|m| m.project_id == project_id && m.environment == "default")
+                .map(|m| m.name.clone())
+                .collect();
+            unique_names.sort();
+            unique_names.dedup();
+            unique_names
+        }
+    };
 
     Ok((StatusCode::OK, Json(serde_json::json!({ "data": names }))))
 }
@@ -170,111 +188,214 @@ pub(crate) async fn get_metrics_query(
 
     let project_id = state.default_project_id.as_ref();
 
-    let agg_expr = match agg {
-        "avg" => "AVG(value)::DOUBLE PRECISION",
-        "max" => "MAX(value)::DOUBLE PRECISION",
-        "min" => "MIN(value)::DOUBLE PRECISION",
-        "sum" => "SUM(value)::DOUBLE PRECISION",
-        "last" => "(ARRAY_AGG(value ORDER BY timestamp DESC))[1]::DOUBLE PRECISION",
-        "p50" => "(percentile_cont(0.5) WITHIN GROUP (ORDER BY value))::DOUBLE PRECISION",
-        "p90" => "(percentile_cont(0.9) WITHIN GROUP (ORDER BY value))::DOUBLE PRECISION",
-        "p99" => "(percentile_cont(0.99) WITHIN GROUP (ORDER BY value))::DOUBLE PRECISION",
-        _ => unreachable!(),
-    };
-
-    const MAX_POINTS_PER_SERIES: i64 = 1000;
-    const MAX_SERIES: i64 = 50;
-
-    let mut builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
-        "WITH filtered AS (\n  SELECT\n    to_timestamp(floor(extract(epoch from timestamp) / ",
-    );
-    builder.push_bind(step_seconds);
-    builder.push(") * ");
-    builder.push_bind(step_seconds);
-    builder.push(
-        ") AS bucket_ts,\n    labels,\n    value,\n    timestamp\n  FROM metrics\n  WHERE project_id = ",
-    );
-    builder.push_bind(project_id);
-    builder.push(" AND environment = 'default'");
-    builder.push(" AND name = ");
-    builder.push_bind(q.name);
-    builder.push(" AND timestamp >= ");
-    builder.push_bind(from_ts);
-    builder.push(" AND timestamp <= ");
-    builder.push_bind(to_ts);
-    if let Some(f) = &labels_filter {
-        builder.push(" AND labels @> ");
-        builder.push_bind(f.clone());
-    }
-
-    builder.push("),\naggregated AS (\n  SELECT\n    bucket_ts,\n    ");
-    if let Some(ref group_key) = q.group_by {
-        builder.push("jsonb_build_object(");
-        builder.push_bind(group_key.clone());
-        builder.push(", labels ->> ");
-        builder.push_bind(group_key.clone());
-        builder.push(") AS labels,\n    ");
-    } else {
-        builder.push("labels,\n    ");
-    }
-    builder.push(agg_expr);
-    builder.push(" AS value\n  FROM filtered\n  GROUP BY bucket_ts, ");
-    if let Some(ref group_key) = q.group_by {
-        builder.push("labels ->> ");
-        builder.push_bind(group_key.clone());
-    } else {
-        builder.push("labels");
-    }
-    builder.push(
-        "\n),\nranked AS (\n  SELECT\n    bucket_ts,\n    labels,\n    value,\n    ROW_NUMBER() OVER (PARTITION BY labels ORDER BY bucket_ts ASC) AS point_rank,\n    DENSE_RANK() OVER (ORDER BY labels) AS series_rank\n  FROM aggregated\n)\nSELECT\n  bucket_ts,\n  labels,\n  value,\n  point_rank,\n  series_rank\nFROM ranked\nWHERE point_rank <= ",
-    );
-    builder.push_bind(MAX_POINTS_PER_SERIES);
-    builder.push(" AND series_rank <= ");
-    builder.push_bind(MAX_SERIES);
-    builder.push("\nORDER BY labels, bucket_ts ASC");
-
-    #[derive(Debug, sqlx::FromRow)]
-    struct MetricsQueryLimitedRow {
-        bucket_ts: DateTime<Utc>,
-        labels: JsonValue,
-        value: f64,
-        point_rank: i64,
-        series_rank: i64,
-    }
-
-    let rows: Vec<MetricsQueryLimitedRow> = builder.build_query_as().fetch_all(&state.pool).await?;
-
     let mut series_map: BTreeMap<String, MetricsSeries> = BTreeMap::new();
     let mut points_truncated = false;
     let mut series_truncated = false;
     let mut latest_bucket: Option<DateTime<Utc>> = None;
 
-    for r in rows {
-        if r.point_rank > MAX_POINTS_PER_SERIES {
-            points_truncated = true;
-            continue;
-        }
-        if r.series_rank > MAX_SERIES {
-            series_truncated = true;
-            continue;
-        }
+    match &state.db {
+        crate::state::DatabaseConnection::Postgres(pool) => {
+            let agg_expr = match agg {
+                "avg" => "AVG(value)::DOUBLE PRECISION",
+                "max" => "MAX(value)::DOUBLE PRECISION",
+                "min" => "MIN(value)::DOUBLE PRECISION",
+                "sum" => "SUM(value)::DOUBLE PRECISION",
+                "last" => "(ARRAY_AGG(value ORDER BY timestamp DESC))[1]::DOUBLE PRECISION",
+                "p50" => "(percentile_cont(0.5) WITHIN GROUP (ORDER BY value))::DOUBLE PRECISION",
+                "p90" => "(percentile_cont(0.9) WITHIN GROUP (ORDER BY value))::DOUBLE PRECISION",
+                "p99" => "(percentile_cont(0.99) WITHIN GROUP (ORDER BY value))::DOUBLE PRECISION",
+                _ => unreachable!(),
+            };
 
-        match latest_bucket {
-            Some(prev) if r.bucket_ts > prev => latest_bucket = Some(r.bucket_ts),
-            None => latest_bucket = Some(r.bucket_ts),
-            _ => {}
+            const MAX_POINTS_PER_SERIES: i64 = 1000;
+            const MAX_SERIES: i64 = 50;
+
+            let mut builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
+                "WITH filtered AS (\n  SELECT\n    to_timestamp(floor(extract(epoch from timestamp) / ",
+            );
+            builder.push_bind(step_seconds);
+            builder.push(") * ");
+            builder.push_bind(step_seconds);
+            builder.push(
+                ") AS bucket_ts,\n    labels,\n    value,\n    timestamp\n  FROM metrics\n  WHERE project_id = ",
+            );
+            builder.push_bind(project_id);
+            builder.push(" AND environment = 'default'");
+            builder.push(" AND name = ");
+            builder.push_bind(q.name);
+            builder.push(" AND timestamp >= ");
+            builder.push_bind(from_ts);
+            builder.push(" AND timestamp <= ");
+            builder.push_bind(to_ts);
+            if let Some(f) = &labels_filter {
+                builder.push(" AND labels @> ");
+                builder.push_bind(f.clone());
+            }
+
+            builder.push("),\naggregated AS (\n  SELECT\n    bucket_ts,\n    ");
+            if let Some(ref group_key) = q.group_by {
+                builder.push("jsonb_build_object(");
+                builder.push_bind(group_key.clone());
+                builder.push(", labels ->> ");
+                builder.push_bind(group_key.clone());
+                builder.push(") AS labels,\n    ");
+            } else {
+                builder.push("labels,\n    ");
+            }
+            builder.push(agg_expr);
+            builder.push(" AS value\n  FROM filtered\n  GROUP BY bucket_ts, ");
+            if let Some(ref group_key) = q.group_by {
+                builder.push("labels ->> ");
+                builder.push_bind(group_key.clone());
+            } else {
+                builder.push("labels");
+            }
+            builder.push(
+                "\n),\nranked AS (\n  SELECT\n    bucket_ts,\n    labels,\n    value,\n    ROW_NUMBER() OVER (PARTITION BY labels ORDER BY bucket_ts ASC) AS point_rank,\n    DENSE_RANK() OVER (ORDER BY labels) AS series_rank\n  FROM aggregated\n)\nSELECT\n  bucket_ts,\n  labels,\n  value,\n  point_rank,\n  series_rank\nFROM ranked\nWHERE point_rank <= ",
+            );
+            builder.push_bind(MAX_POINTS_PER_SERIES);
+            builder.push(" AND series_rank <= ");
+            builder.push_bind(MAX_SERIES);
+            builder.push("\nORDER BY labels, bucket_ts ASC");
+
+            #[derive(Debug, sqlx::FromRow)]
+            struct MetricsQueryLimitedRow {
+                bucket_ts: DateTime<Utc>,
+                labels: JsonValue,
+                value: f64,
+                point_rank: i64,
+                series_rank: i64,
+            }
+
+            let rows: Vec<MetricsQueryLimitedRow> = builder.build_query_as().fetch_all(pool).await?;
+
+            for r in rows {
+                if r.point_rank > MAX_POINTS_PER_SERIES {
+                    points_truncated = true;
+                    continue;
+                }
+                if r.series_rank > MAX_SERIES {
+                    series_truncated = true;
+                    continue;
+                }
+
+                match latest_bucket {
+                    Some(prev) if r.bucket_ts > prev => latest_bucket = Some(r.bucket_ts),
+                    None => latest_bucket = Some(r.bucket_ts),
+                    _ => {}
+                }
+
+                let key = r.labels.to_string();
+                let entry = series_map.entry(key).or_insert_with(|| MetricsSeries {
+                    labels: r.labels.clone(),
+                    values: Vec::new(),
+                });
+
+                entry.values.push(MetricValuePoint {
+                    timestamp: r.bucket_ts.to_rfc3339(),
+                    value: r.value,
+                });
+            }
         }
+        crate::state::DatabaseConnection::Memory(mem_db) => {
+            let metrics_guard = mem_db
+                .metrics
+                .lock()
+                .map_err(|e| ApiError::Internal(format!("Mutex lock error: {e}")))?;
 
-        let key = r.labels.to_string();
-        let entry = series_map.entry(key).or_insert_with(|| MetricsSeries {
-            labels: r.labels.clone(),
-            values: Vec::new(),
-        });
+            let mut grouped: BTreeMap<String, (JsonValue, BTreeMap<DateTime<Utc>, Vec<(f64, DateTime<Utc>)>>)> = BTreeMap::new();
 
-        entry.values.push(MetricValuePoint {
-            timestamp: r.bucket_ts.to_rfc3339(),
-            value: r.value,
-        });
+            for m in metrics_guard.iter() {
+                if m.project_id != project_id
+                    || m.environment != "default"
+                    || m.name != q.name
+                    || m.timestamp < from_ts
+                    || m.timestamp > to_ts
+                {
+                    continue;
+                }
+
+                if let Some(ref filter) = labels_filter {
+                    if !json_contains(&m.labels, filter) {
+                        continue;
+                    }
+                }
+
+                let bucket_seconds = (m.timestamp.timestamp() / step_seconds) * step_seconds;
+                let bucket_ts = DateTime::<Utc>::from_timestamp(bucket_seconds, 0).unwrap_or(m.timestamp);
+
+                let final_labels = if let Some(ref group_key) = q.group_by {
+                    let mut map = serde_json::Map::new();
+                    let val = m.labels.get(group_key).cloned().unwrap_or(JsonValue::Null);
+                    map.insert(group_key.clone(), val);
+                    JsonValue::Object(map)
+                } else {
+                    m.labels.clone()
+                };
+
+                let key = final_labels.to_string();
+                let entry = grouped.entry(key).or_insert_with(|| (final_labels, BTreeMap::new()));
+                entry.1.entry(bucket_ts).or_default().push((m.value, m.timestamp));
+            }
+
+            let total_series = grouped.len();
+            if total_series > 50 {
+                series_truncated = true;
+            }
+
+            for (key, (final_labels, buckets)) in grouped.into_iter().take(50) {
+                let mut values_vec = Vec::new();
+                let total_buckets = buckets.len();
+                if total_buckets > 1000 {
+                    points_truncated = true;
+                }
+
+                for (bucket_ts, mut pts) in buckets.into_iter().take(1000) {
+                    match latest_bucket {
+                        Some(prev) if bucket_ts > prev => latest_bucket = Some(bucket_ts),
+                        None => latest_bucket = Some(bucket_ts),
+                        _ => {}
+                    }
+
+                    let val = match agg {
+                        "avg" => {
+                            let sum: f64 = pts.iter().map(|p| p.0).sum();
+                            sum / pts.len() as f64
+                        }
+                        "max" => pts.iter().map(|p| p.0).fold(f64::MIN, |a, b| a.max(b)),
+                        "min" => pts.iter().map(|p| p.0).fold(f64::MAX, |a, b| a.min(b)),
+                        "sum" => pts.iter().map(|p| p.0).sum(),
+                        "last" => {
+                            pts.sort_by_key(|p| p.1);
+                            pts.last().map(|p| p.0).unwrap_or(0.0)
+                        }
+                        "p50" => {
+                            let vals: Vec<f64> = pts.iter().map(|p| p.0).collect();
+                            percentile(&vals, 0.5)
+                        }
+                        "p90" => {
+                            let vals: Vec<f64> = pts.iter().map(|p| p.0).collect();
+                            percentile(&vals, 0.9)
+                        }
+                        "p99" => {
+                            let vals: Vec<f64> = pts.iter().map(|p| p.0).collect();
+                            percentile(&vals, 0.99)
+                        }
+                        _ => 0.0,
+                    };
+
+                    values_vec.push(MetricValuePoint {
+                        timestamp: bucket_ts.to_rfc3339(),
+                        value: val,
+                    });
+                }
+
+                series_map.insert(key, MetricsSeries {
+                    labels: final_labels,
+                    values: values_vec,
+                });
+            }
+        }
     }
 
     let data = series_map.into_values().collect::<Vec<_>>();
@@ -349,98 +470,216 @@ pub(crate) async fn get_metrics_daily(
 
     let project_id = state.default_project_id.as_ref();
 
-    let mut count_builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
-        "SELECT COUNT(*)::BIGINT FROM (SELECT date_trunc('day', t.\"timestamp\")::date AS day FROM traces t WHERE 1=1",
-    );
-    count_builder.push(" AND t.project_id = ");
-    count_builder.push_bind(project_id.to_string());
-    count_builder.push(" AND t.\"timestamp\" >= ");
-    count_builder.push_bind(from_ts);
-    count_builder.push(" AND t.\"timestamp\" <= ");
-    count_builder.push_bind(to_ts);
+    let (total_items, total_pages, items) = match &state.db {
+        crate::state::DatabaseConnection::Postgres(pool) => {
+            let mut count_builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
+                "SELECT COUNT(*)::BIGINT FROM (SELECT date_trunc('day', t.\"timestamp\")::date AS day FROM traces t WHERE 1=1",
+            );
+            count_builder.push(" AND t.project_id = ");
+            count_builder.push_bind(project_id.to_string());
+            count_builder.push(" AND t.\"timestamp\" >= ");
+            count_builder.push_bind(from_ts);
+            count_builder.push(" AND t.\"timestamp\" <= ");
+            count_builder.push_bind(to_ts);
 
-    if let Some(trace_name) = &q.trace_name {
-        count_builder.push(" AND t.name = ");
-        count_builder.push_bind(trace_name.clone());
-    }
-    if let Some(user_id) = &q.user_id {
-        count_builder.push(" AND t.user_id = ");
-        count_builder.push_bind(user_id.clone());
-    }
-    if !q.tags.is_empty() {
-        count_builder.push(" AND t.tags @> ");
-        count_builder.push_bind(q.tags.clone());
-    }
-    if let Some(version) = &q.version {
-        count_builder.push(" AND t.version = ");
-        count_builder.push_bind(version.clone());
-    }
-    if let Some(release) = &q.release {
-        count_builder.push(" AND t.release = ");
-        count_builder.push_bind(release.clone());
-    }
-    count_builder.push(" GROUP BY 1) x");
+            if let Some(trace_name) = &q.trace_name {
+                count_builder.push(" AND t.name = ");
+                count_builder.push_bind(trace_name.clone());
+            }
+            if let Some(user_id) = &q.user_id {
+                count_builder.push(" AND t.user_id = ");
+                count_builder.push_bind(user_id.clone());
+            }
+            if !q.tags.is_empty() {
+                count_builder.push(" AND t.tags @> ");
+                count_builder.push_bind(q.tags.clone());
+            }
+            if let Some(version) = &q.version {
+                count_builder.push(" AND t.version = ");
+                count_builder.push_bind(version.clone());
+            }
+            if let Some(release) = &q.release {
+                count_builder.push(" AND t.release = ");
+                count_builder.push_bind(release.clone());
+            }
+            count_builder.push(" GROUP BY 1) x");
 
-    let total_items: i64 = count_builder
-        .build_query_scalar()
-        .fetch_one(&state.pool)
-        .await?;
+            let total_items: i64 = count_builder
+                .build_query_scalar()
+                .fetch_one(pool)
+                .await?;
 
-    let total_pages = if total_items == 0 {
-        0
-    } else {
-        (total_items + limit - 1) / limit
+            let total_pages = if total_items == 0 {
+                0
+            } else {
+                (total_items + limit - 1) / limit
+            };
+
+            let mut builder: QueryBuilder<'_, sqlx::Postgres> =
+                QueryBuilder::new("WITH filtered_traces AS (SELECT t.* FROM traces t WHERE 1=1");
+            builder.push(" AND t.project_id = ");
+            builder.push_bind(project_id.to_string());
+            builder.push(" AND t.\"timestamp\" >= ");
+            builder.push_bind(from_ts);
+            builder.push(" AND t.\"timestamp\" <= ");
+            builder.push_bind(to_ts);
+
+            if let Some(trace_name) = &q.trace_name {
+                builder.push(" AND t.name = ");
+                builder.push_bind(trace_name.clone());
+            }
+            if let Some(user_id) = &q.user_id {
+                builder.push(" AND t.user_id = ");
+                builder.push_bind(user_id.clone());
+            }
+            if !q.tags.is_empty() {
+                builder.push(" AND t.tags @> ");
+                builder.push_bind(q.tags.clone());
+            }
+            if let Some(version) = &q.version {
+                builder.push(" AND t.version = ");
+                builder.push_bind(version.clone());
+            }
+            if let Some(release) = &q.release {
+                builder.push(" AND t.release = ");
+                builder.push_bind(release.clone());
+            }
+
+            builder.push(
+                ")\n, daily AS (\n  SELECT\n    date_trunc('day', ft.\"timestamp\")::date AS day,\n    COUNT(*)::BIGINT AS count_traces,\n    COALESCE(SUM(ft.total_cost), 0)::DOUBLE PRECISION AS total_cost\n  FROM filtered_traces ft\n  GROUP BY 1\n)\n, daily_obs AS (\n  SELECT\n    date_trunc('day', ft.\"timestamp\")::date AS day,\n    COUNT(o.id)::BIGINT AS count_observations\n  FROM filtered_traces ft\n  JOIN observations o ON o.trace_id = ft.id\n  GROUP BY 1\n)\n, model_usage AS (\n  SELECT\n    date_trunc('day', ft.\"timestamp\")::date AS day,\n    COALESCE(o.model, 'unknown') AS model,\n    COALESCE(SUM(o.prompt_tokens), 0)::BIGINT AS input_usage,\n    COALESCE(SUM(o.completion_tokens), 0)::BIGINT AS output_usage,\n    COALESCE(SUM(o.total_tokens), 0)::BIGINT AS total_usage,\n    COUNT(DISTINCT ft.id)::BIGINT AS count_traces,\n    COUNT(o.id)::BIGINT AS count_observations,\n    COALESCE(SUM(o.calculated_total_cost), 0)::DOUBLE PRECISION AS total_cost\n  FROM filtered_traces ft\n  JOIN observations o ON o.trace_id = ft.id\n  WHERE o.type = 'GENERATION'\n  GROUP BY 1, 2\n)\n, daily_usage AS (\n  SELECT\n    mu.day,\n    COALESCE(jsonb_agg(\n      jsonb_build_object(\n        'model', mu.model,\n        'inputUsage', mu.input_usage,\n        'outputUsage', mu.output_usage,\n        'totalUsage', mu.total_usage,\n        'countTraces', mu.count_traces,\n        'countObservations', mu.count_observations,\n        'totalCost', mu.total_cost\n      ) ORDER BY mu.total_cost DESC\n    ), '[]'::jsonb) AS usage\n  FROM model_usage mu\n  GROUP BY 1\n)\nSELECT\n  d.day AS day,\n  d.count_traces AS count_traces,\n  COALESCE(dob.count_observations, 0) AS count_observations,\n  d.total_cost AS total_cost,\n  COALESCE(du.usage, '[]'::jsonb) AS usage\nFROM daily d\nLEFT JOIN daily_obs dob ON dob.day = d.day\nLEFT JOIN daily_usage du ON du.day = d.day\nORDER BY d.day DESC\nLIMIT ",
+            );
+            builder.push_bind(limit);
+            builder.push(" OFFSET ");
+            builder.push_bind(offset);
+
+            let rows: Vec<MetricsDailyRow> = builder.build_query_as().fetch_all(pool).await?;
+
+            let items = rows
+                .into_iter()
+                .map(|r| MetricsDailyItem {
+                    date: r.day.to_string(),
+                    count_traces: r.count_traces,
+                    count_observations: r.count_observations,
+                    total_cost: r.total_cost,
+                    usage: r.usage,
+                })
+                .collect::<Vec<_>>();
+            (total_items, total_pages, items)
+        }
+        crate::state::DatabaseConnection::Memory(mem_db) => {
+            let filtered_traces: Vec<crate::state::TraceRow> = mem_db
+                .traces
+                .iter()
+                .map(|item| item.value().clone())
+                .filter(|t| {
+                    if t.project_id != project_id
+                        || t.timestamp < from_ts
+                        || t.timestamp > to_ts
+                    {
+                        return false;
+                    }
+                    if let Some(ref trace_name) = q.trace_name {
+                        if t.name.as_ref() != Some(trace_name) {
+                            return false;
+                        }
+                    }
+                    if let Some(ref user_id) = q.user_id {
+                        if t.user_id.as_ref() != Some(user_id) {
+                            return false;
+                        }
+                    }
+                    if !q.tags.is_empty() {
+                        if !q.tags.iter().all(|tag| t.tags.contains(tag)) {
+                            return false;
+                        }
+                    }
+                    if let Some(ref version) = q.version {
+                        if t.version.as_ref() != Some(version) {
+                            return false;
+                        }
+                    }
+                    if let Some(ref release) = q.release {
+                        if t.release.as_ref() != Some(release) {
+                            return false;
+                        }
+                    }
+                    true
+                })
+                .collect();
+
+            let mut trace_to_obs: HashMap<uuid::Uuid, Vec<crate::state::ObservationRow>> = HashMap::new();
+            for entry in mem_db.observations.iter() {
+                let obs = entry.value();
+                trace_to_obs.entry(obs.trace_id).or_default().push(obs.clone());
+            }
+
+            let mut daily_groups: BTreeMap<NaiveDate, (Vec<crate::state::TraceRow>, Vec<crate::state::ObservationRow>)> = BTreeMap::new();
+            for t in filtered_traces {
+                let day = t.timestamp.date_naive();
+                let entry = daily_groups.entry(day).or_default();
+                if let Some(obs_list) = trace_to_obs.get(&t.id) {
+                    entry.1.extend(obs_list.clone());
+                }
+                entry.0.push(t);
+            }
+
+            let mut daily_results = Vec::new();
+            for (day, (traces, obs)) in daily_groups {
+                let count_traces = traces.len() as i64;
+                let count_observations = obs.len() as i64;
+                let total_cost: f64 = traces.iter().map(|t| t.total_cost.unwrap_or(0.0)).sum();
+
+                let mut model_groups: HashMap<String, (i64, i64, i64, std::collections::HashSet<uuid::Uuid>, i64, f64)> = HashMap::new();
+                for o in obs.iter().filter(|o| o.r#type == "GENERATION") {
+                    let model = o.model.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| "unknown".to_string());
+                    let entry = model_groups.entry(model).or_insert((0, 0, 0, std::collections::HashSet::new(), 0, 0.0));
+                    entry.0 += o.prompt_tokens.unwrap_or(0);
+                    entry.1 += o.completion_tokens.unwrap_or(0);
+                    entry.2 += o.total_tokens.unwrap_or(0);
+                    entry.3.insert(o.trace_id);
+                    entry.4 += 1;
+                    entry.5 += o.calculated_total_cost.unwrap_or(0.0);
+                }
+
+                let mut usage_list = Vec::new();
+                for (model, (input_usage, output_usage, total_usage, trace_ids, count_obs, model_cost)) in model_groups {
+                    usage_list.push(serde_json::json!({
+                        "model": model,
+                        "inputUsage": input_usage,
+                        "outputUsage": output_usage,
+                        "totalUsage": total_usage,
+                        "countTraces": trace_ids.len() as i64,
+                        "countObservations": count_obs,
+                        "totalCost": model_cost,
+                    }));
+                }
+
+                usage_list.sort_by(|a, b| {
+                    let a_cost = a["totalCost"].as_f64().unwrap_or(0.0);
+                    let b_cost = b["totalCost"].as_f64().unwrap_or(0.0);
+                    b_cost.partial_cmp(&a_cost).unwrap_or(std::cmp::Ordering::Equal)
+                });
+
+                daily_results.push(MetricsDailyItem {
+                    date: day.to_string(),
+                    count_traces,
+                    count_observations,
+                    total_cost,
+                    usage: JsonValue::Array(usage_list),
+                });
+            }
+
+            daily_results.sort_by(|a, b| b.date.cmp(&a.date));
+            let total_items = daily_results.len() as i64;
+            let total_pages = if total_items == 0 { 0 } else { (total_items + limit - 1) / limit };
+            let paged = daily_results
+                .into_iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .collect::<Vec<_>>();
+            (total_items, total_pages, paged)
+        }
     };
-
-    let mut builder: QueryBuilder<'_, sqlx::Postgres> =
-        QueryBuilder::new("WITH filtered_traces AS (SELECT t.* FROM traces t WHERE 1=1");
-    builder.push(" AND t.project_id = ");
-    builder.push_bind(project_id.to_string());
-    builder.push(" AND t.\"timestamp\" >= ");
-    builder.push_bind(from_ts);
-    builder.push(" AND t.\"timestamp\" <= ");
-    builder.push_bind(to_ts);
-
-    if let Some(trace_name) = &q.trace_name {
-        builder.push(" AND t.name = ");
-        builder.push_bind(trace_name.clone());
-    }
-    if let Some(user_id) = &q.user_id {
-        builder.push(" AND t.user_id = ");
-        builder.push_bind(user_id.clone());
-    }
-    if !q.tags.is_empty() {
-        builder.push(" AND t.tags @> ");
-        builder.push_bind(q.tags.clone());
-    }
-    if let Some(version) = &q.version {
-        builder.push(" AND t.version = ");
-        builder.push_bind(version.clone());
-    }
-    if let Some(release) = &q.release {
-        builder.push(" AND t.release = ");
-        builder.push_bind(release.clone());
-    }
-
-    builder.push(
-        ")\n, daily AS (\n  SELECT\n    date_trunc('day', ft.\"timestamp\")::date AS day,\n    COUNT(*)::BIGINT AS count_traces,\n    COALESCE(SUM(ft.total_cost), 0)::DOUBLE PRECISION AS total_cost\n  FROM filtered_traces ft\n  GROUP BY 1\n)\n, daily_obs AS (\n  SELECT\n    date_trunc('day', ft.\"timestamp\")::date AS day,\n    COUNT(o.id)::BIGINT AS count_observations\n  FROM filtered_traces ft\n  JOIN observations o ON o.trace_id = ft.id\n  GROUP BY 1\n)\n, model_usage AS (\n  SELECT\n    date_trunc('day', ft.\"timestamp\")::date AS day,\n    COALESCE(o.model, 'unknown') AS model,\n    COALESCE(SUM(o.prompt_tokens), 0)::BIGINT AS input_usage,\n    COALESCE(SUM(o.completion_tokens), 0)::BIGINT AS output_usage,\n    COALESCE(SUM(o.total_tokens), 0)::BIGINT AS total_usage,\n    COUNT(DISTINCT ft.id)::BIGINT AS count_traces,\n    COUNT(o.id)::BIGINT AS count_observations,\n    COALESCE(SUM(o.calculated_total_cost), 0)::DOUBLE PRECISION AS total_cost\n  FROM filtered_traces ft\n  JOIN observations o ON o.trace_id = ft.id\n  WHERE o.type = 'GENERATION'\n  GROUP BY 1, 2\n)\n, daily_usage AS (\n  SELECT\n    mu.day,\n    COALESCE(jsonb_agg(\n      jsonb_build_object(\n        'model', mu.model,\n        'inputUsage', mu.input_usage,\n        'outputUsage', mu.output_usage,\n        'totalUsage', mu.total_usage,\n        'countTraces', mu.count_traces,\n        'countObservations', mu.count_observations,\n        'totalCost', mu.total_cost\n      ) ORDER BY mu.total_cost DESC\n    ), '[]'::jsonb) AS usage\n  FROM model_usage mu\n  GROUP BY 1\n)\nSELECT\n  d.day AS day,\n  d.count_traces AS count_traces,\n  COALESCE(dob.count_observations, 0) AS count_observations,\n  d.total_cost AS total_cost,\n  COALESCE(du.usage, '[]'::jsonb) AS usage\nFROM daily d\nLEFT JOIN daily_obs dob ON dob.day = d.day\nLEFT JOIN daily_usage du ON du.day = d.day\nORDER BY d.day DESC\nLIMIT ",
-    );
-    builder.push_bind(limit);
-    builder.push(" OFFSET ");
-    builder.push_bind(offset);
-
-    let rows: Vec<MetricsDailyRow> = builder.build_query_as().fetch_all(&state.pool).await?;
-
-    let items = rows
-        .into_iter()
-        .map(|r| MetricsDailyItem {
-            date: r.day.to_string(),
-            count_traces: r.count_traces,
-            count_observations: r.count_observations,
-            total_cost: r.total_cost,
-            usage: r.usage,
-        })
-        .collect::<Vec<_>>();
 
     Ok((
         StatusCode::OK,
@@ -465,7 +704,7 @@ fn labels_to_json(labels: HashMap<String, String>) -> JsonValue {
 }
 
 pub(crate) async fn metrics_worker(
-    pool: PgPool,
+    db: crate::state::DatabaseConnection,
     default_project_id: Arc<str>,
     mut rx: mpsc::Receiver<MetricsBatchRequest>,
 ) {
@@ -491,17 +730,17 @@ pub(crate) async fn metrics_worker(
             }
         }
 
-        if let Err(err) = write_metrics_batches(&pool, default_project_id.as_ref(), batches).await {
+        if let Err(err) = write_metrics_batches(&db, default_project_id.as_ref(), batches).await {
             tracing::error!(error = ?err, "failed to write metrics batch");
         }
     }
 }
 
 async fn write_metrics_batches(
-    pool: &PgPool,
+    db: &crate::state::DatabaseConnection,
     default_project_id: &str,
     payloads: Vec<MetricsBatchRequest>,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), anyhow::Error> {
     let mut points: Vec<MetricPointIngest> = Vec::new();
     for p in payloads {
         points.extend(p.metrics);
@@ -510,22 +749,44 @@ async fn write_metrics_batches(
         return Ok(());
     }
 
-    let mut tx = pool.begin().await?;
+    match db {
+        crate::state::DatabaseConnection::Postgres(pool) => {
+            let mut tx = pool.begin().await?;
 
-    let mut builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
-        "INSERT INTO metrics (project_id, environment, name, labels, value, timestamp) ",
-    );
-    builder.push_values(points, |mut b, m| {
-        b.push_bind(default_project_id.to_string())
-            .push_bind("default".to_string())
-            .push_bind(m.name)
-            .push_bind(labels_to_json(m.labels))
-            .push_bind(m.value)
-            .push_bind(m.timestamp);
-    });
+            let mut builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
+                "INSERT INTO metrics (project_id, environment, name, labels, value, timestamp) ",
+            );
+            builder.push_values(points, |mut b, m| {
+                b.push_bind(default_project_id.to_string())
+                    .push_bind("default".to_string())
+                    .push_bind(m.name)
+                    .push_bind(labels_to_json(m.labels))
+                    .push_bind(m.value)
+                    .push_bind(m.timestamp);
+            });
 
-    builder.build().execute(&mut *tx).await?;
-    tx.commit().await?;
+            builder.build().execute(&mut *tx).await?;
+            tx.commit().await?;
+        }
+        crate::state::DatabaseConnection::Memory(mem_db) => {
+            let mut metrics_guard = mem_db
+                .metrics
+                .lock()
+                .map_err(|e| anyhow::anyhow!("Mutex lock error: {e}"))?;
+            let now = Utc::now();
+            for m in points {
+                metrics_guard.push(crate::state::MetricRow {
+                    project_id: default_project_id.to_string(),
+                    environment: "default".to_string(),
+                    name: m.name,
+                    labels: labels_to_json(m.labels),
+                    value: m.value,
+                    timestamp: m.timestamp,
+                    created_at: now,
+                });
+            }
+        }
+    }
     Ok(())
 }
 
@@ -588,8 +849,10 @@ pub(crate) async fn get_metrics_overview(
     let to_ts = config.to_timestamp.unwrap_or_else(|| Utc::now());
 
     if config.view == "traces" {
-        let row: (i64, f64, f64, f64) = sqlx::query_as(
-            r#"
+        let res = match &state.db {
+            crate::state::DatabaseConnection::Postgres(pool) => {
+                let row: (i64, f64, f64, f64) = sqlx::query_as(
+                    r#"
 SELECT
   COUNT(*)::BIGINT,
   COALESCE(AVG(latency), 0.0) * 1000.0,
@@ -597,24 +860,61 @@ SELECT
   COALESCE(percentile_cont(0.99) WITHIN GROUP (ORDER BY latency), 0.0) * 1000.0
 FROM traces
 WHERE project_id = $1 AND timestamp >= $2 AND timestamp <= $3
-            "#,
-        )
-        .bind(project_id)
-        .bind(from_ts)
-        .bind(to_ts)
-        .fetch_one(&state.pool)
-        .await?;
+                    "#,
+                )
+                .bind(&project_id)
+                .bind(from_ts)
+                .bind(to_ts)
+                .fetch_one(pool)
+                .await?;
 
-        let res = serde_json::json!({
-            "data": [
-                {
-                    "count_count": row.0,
-                    "avg_latency": row.1,
-                    "p95_latency": row.2,
-                    "p99_latency": row.3,
+                serde_json::json!({
+                    "data": [
+                        {
+                            "count_count": row.0,
+                            "avg_latency": row.1,
+                            "p95_latency": row.2,
+                            "p99_latency": row.3,
+                        }
+                    ]
+                })
+            }
+            crate::state::DatabaseConnection::Memory(mem_db) => {
+                let mut count = 0;
+                let mut latencies = Vec::new();
+                for entry in mem_db.traces.iter() {
+                    let t = entry.value();
+                    if t.project_id == project_id && t.timestamp >= from_ts && t.timestamp <= to_ts {
+                        count += 1;
+                        if let Some(lat) = t.latency {
+                            latencies.push(lat);
+                        }
+                    }
                 }
-            ]
-        });
+
+                let (avg, p95, p99) = if latencies.is_empty() {
+                    (0.0, 0.0, 0.0)
+                } else {
+                    let sum: f64 = latencies.iter().sum();
+                    let avg = sum / latencies.len() as f64;
+                    let p95 = percentile(&latencies, 0.95);
+                    let p99 = percentile(&latencies, 0.99);
+                    (avg, p95, p99)
+                };
+
+                serde_json::json!({
+                    "data": [
+                        {
+                            "count_count": count,
+                            "avg_latency": avg * 1000.0,
+                            "p95_latency": p95 * 1000.0,
+                            "p99_latency": p99 * 1000.0,
+                        }
+                    ]
+                })
+            }
+        };
+
         Ok((StatusCode::OK, Json(res)))
     } else if config.view == "observations" {
         let is_error_filter = config
@@ -623,24 +923,45 @@ WHERE project_id = $1 AND timestamp >= $2 AND timestamp <= $3
             .any(|f| f.column == "level" && f.value == "ERROR");
 
         if is_error_filter {
-            let rows: Vec<(uuid::Uuid,)> = sqlx::query_as(
-                r#"
+            let trace_ids: Vec<String> = match &state.db {
+                crate::state::DatabaseConnection::Postgres(pool) => {
+                    let rows: Vec<(uuid::Uuid,)> = sqlx::query_as(
+                        r#"
 SELECT DISTINCT trace_id
 FROM observations
 WHERE project_id = $1 AND level = 'ERROR' AND start_time >= $2 AND start_time <= $3
-                "#,
-            )
-            .bind(project_id)
-            .bind(from_ts)
-            .bind(to_ts)
-            .fetch_all(&state.pool)
-            .await?;
+                        "#,
+                    )
+                    .bind(&project_id)
+                    .bind(from_ts)
+                    .bind(to_ts)
+                    .fetch_all(pool)
+                    .await?;
 
-            let data_list = rows
+                    rows.into_iter().map(|r| r.0.to_string()).collect()
+                }
+                crate::state::DatabaseConnection::Memory(mem_db) => {
+                    let mut ids = std::collections::HashSet::new();
+                    for entry in mem_db.observations.iter() {
+                        let o = entry.value();
+                        let start_time = o.start_time.unwrap_or(o.created_at);
+                        if o.project_id == project_id
+                            && o.level.as_deref() == Some("ERROR")
+                            && start_time >= from_ts
+                            && start_time <= to_ts
+                        {
+                            ids.insert(o.trace_id.to_string());
+                        }
+                    }
+                    ids.into_iter().collect()
+                }
+            };
+
+            let data_list = trace_ids
                 .into_iter()
-                .map(|r| {
+                .map(|tid| {
                     serde_json::json!({
-                        "traceId": r.0.to_string()
+                        "traceId": tid
                     })
                 })
                 .collect::<Vec<_>>();
@@ -660,5 +981,40 @@ WHERE project_id = $1 AND level = 'ERROR' AND start_time >= $2 AND start_time <=
             "data": []
         });
         Ok((StatusCode::OK, Json(res)))
+    }
+}
+
+fn json_contains(target: &JsonValue, filter: &JsonValue) -> bool {
+    match (target, filter) {
+        (JsonValue::Object(t_map), JsonValue::Object(f_map)) => {
+            for (k, v) in f_map {
+                match t_map.get(k) {
+                    Some(t_val) => {
+                        if t_val != v {
+                            return false;
+                        }
+                    }
+                    None => return false,
+                }
+            }
+            true
+        }
+        _ => target == filter,
+    }
+}
+
+fn percentile(vals: &[f64], p: f64) -> f64 {
+    if vals.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = vals.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let pos = (sorted.len() - 1) as f64 * p;
+    let idx = pos.floor() as usize;
+    let fract = pos - idx as f64;
+    if idx + 1 < sorted.len() {
+        sorted[idx] * (1.0 - fract) + sorted[idx + 1] * fract
+    } else {
+        sorted[idx]
     }
 }

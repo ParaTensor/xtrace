@@ -56,12 +56,26 @@ pub fn build_router(state: AppState, max_body: usize) -> Router {
 
 /// Start xtrace server (blocks until shutdown signal)
 pub async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
-    let pool = PgPoolOptions::new()
-        .max_connections(20)
-        .connect(&config.database_url)
-        .await?;
+    let mock_storage = std::env::var("XTRACE_MOCK_STORAGE")
+        .map(|s| s == "true")
+        .unwrap_or(false);
+    let json_dir_env = std::env::var("XTRACE_JSON_DIR").ok();
 
-    sqlx::migrate!("./migrations").run(&pool).await?;
+    let db_conn = if mock_storage || json_dir_env.is_ok() {
+        let dir = json_dir_env
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("./.xtrace_data"));
+        let mem_db = Arc::new(crate::state::MemoryDb::new(Some(dir)));
+        mem_db.clone().spawn_sync_loop();
+        crate::state::DatabaseConnection::Memory(mem_db)
+    } else {
+        let pool = PgPoolOptions::new()
+            .max_connections(20)
+            .connect(&config.database_url)
+            .await?;
+        sqlx::migrate!("./migrations").run(&pool).await?;
+        crate::state::DatabaseConnection::Postgres(pool)
+    };
 
     let (ingest_tx, ingest_rx) = mpsc::channel::<BatchIngestRequest>(1000);
     let (metrics_tx, metrics_rx) = mpsc::channel::<MetricsBatchRequest>(5000);
@@ -73,7 +87,7 @@ pub async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
     let ingest_stats = Arc::new(IngestStats::new());
 
     let state = AppState {
-        pool,
+        db: db_conn,
         api_bearer_token: Arc::from(config.api_bearer_token),
         langfuse_public_key: config.langfuse_public_key.map(Arc::from),
         langfuse_secret_key: config.langfuse_secret_key.map(Arc::from),
@@ -89,14 +103,14 @@ pub async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
     };
 
     tokio::spawn(ingest_worker(
-        state.pool.clone(),
+        state.db.clone(),
         state.default_project_id.clone(),
         ingest_rx,
         ingest_stats,
     ));
 
     tokio::spawn(metrics_worker(
-        state.pool.clone(),
+        state.db.clone(),
         state.default_project_id.clone(),
         metrics_rx,
     ));

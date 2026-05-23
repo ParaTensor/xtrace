@@ -241,26 +241,28 @@ pub(crate) async fn get_traces(
     let (order_column, order_desc) = parse_order_by(q.order_by.as_deref())?;
     let project_id = state.default_project_id.to_string();
 
-    let mut count_builder: QueryBuilder<'_, sqlx::Postgres> =
-        QueryBuilder::new("SELECT COUNT(*)::BIGINT AS cnt FROM traces t WHERE 1=1");
-    count_builder.push(" AND t.project_id = ");
-    count_builder.push_bind(project_id.clone());
-    apply_trace_filters(&mut count_builder, &q);
+    match &state.db {
+        crate::state::DatabaseConnection::Postgres(pool) => {
+            let mut count_builder: QueryBuilder<'_, sqlx::Postgres> =
+                QueryBuilder::new("SELECT COUNT(*)::BIGINT AS cnt FROM traces t WHERE 1=1");
+            count_builder.push(" AND t.project_id = ");
+            count_builder.push_bind(project_id.clone());
+            apply_trace_filters(&mut count_builder, &q);
 
-    let total_items: i64 = count_builder
-        .build_query_scalar()
-        .fetch_one(&state.pool)
-        .await?;
+            let total_items: i64 = count_builder
+                .build_query_scalar()
+                .fetch_one(pool)
+                .await?;
 
-    let total_pages = if total_items == 0 {
-        0
-    } else {
-        (total_items + limit - 1) / limit
-    };
+            let total_pages = if total_items == 0 {
+                0
+            } else {
+                (total_items + limit - 1) / limit
+            };
 
-    if !fields.io && !fields.observations && !fields.metrics {
-        let mut builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
-            r#"
+            if !fields.io && !fields.observations && !fields.metrics {
+                let mut builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
+                    r#"
 SELECT
   t.id,
   t.project_id,
@@ -281,222 +283,409 @@ FROM (
   SELECT *
   FROM traces t
   WHERE 1=1
-            "#,
-        );
+                    "#,
+                );
 
-        builder.push(" AND t.project_id = ");
-        builder.push_bind(project_id.clone());
-        apply_trace_filters(&mut builder, &q);
-        builder.push(" ORDER BY ");
-        builder.push(order_column);
-        builder.push(if order_desc { " DESC" } else { " ASC" });
-        builder.push(" LIMIT ");
-        builder.push_bind(limit);
-        builder.push(" OFFSET ");
-        builder.push_bind(offset);
-        builder.push(") t");
+                builder.push(" AND t.project_id = ");
+                builder.push_bind(project_id.clone());
+                apply_trace_filters(&mut builder, &q);
+                builder.push(" ORDER BY ");
+                builder.push(order_column);
+                builder.push(if order_desc { " DESC" } else { " ASC" });
+                builder.push(" LIMIT ");
+                builder.push_bind(limit);
+                builder.push(" OFFSET ");
+                builder.push_bind(offset);
+                builder.push(") t");
 
-        let rows: Vec<TraceListRowCore> = builder.build_query_as().fetch_all(&state.pool).await?;
+                let rows: Vec<TraceListRowCore> = builder.build_query_as().fetch_all(pool).await?;
 
-        let items = rows
-            .into_iter()
-            .map(|r| TraceListItem {
-                html_path: format!("/project/{}/traces/{}", r.project_id, r.id),
-                id: r.id,
-                timestamp: r.timestamp,
-                name: r.name,
-                input: None,
-                output: None,
-                session_id: r.session_id,
-                release: r.release,
-                version: r.version,
-                user_id: r.user_id,
-                metadata: None,
-                tags: r.tags,
-                public: r.public,
-                project_id: r.project_id,
-                external_id: r.external_id,
-                bookmarked: r.bookmarked,
-                environment: r.environment,
-                latency: Some(-1.0),
-                total_cost: Some(-1.0),
-                created_at: r.created_at,
-                updated_at: r.updated_at,
-                observations: vec![],
-                scores: vec![],
-            })
-            .collect::<Vec<_>>();
+                let items = rows
+                    .into_iter()
+                    .map(|r| TraceListItem {
+                        html_path: format!("/project/{}/traces/{}", r.project_id, r.id),
+                        id: r.id,
+                        timestamp: r.timestamp,
+                        name: r.name,
+                        input: None,
+                        output: None,
+                        session_id: r.session_id,
+                        release: r.release,
+                        version: r.version,
+                        user_id: r.user_id,
+                        metadata: None,
+                        tags: r.tags,
+                        public: r.public,
+                        project_id: r.project_id,
+                        external_id: r.external_id,
+                        bookmarked: r.bookmarked,
+                        environment: r.environment,
+                        latency: Some(-1.0),
+                        total_cost: Some(-1.0),
+                        created_at: r.created_at,
+                        updated_at: r.updated_at,
+                        observations: vec![],
+                        scores: vec![],
+                    })
+                    .collect::<Vec<_>>();
 
-        return Ok((
-            StatusCode::OK,
-            Json(PagedData {
-                data: items,
-                meta: PageMeta {
-                    page,
-                    limit,
-                    totalItems: total_items,
-                    totalPages: total_pages,
-                },
-            }),
-        ));
-    }
+                return Ok((
+                    StatusCode::OK,
+                    Json(PagedData {
+                        data: items,
+                        meta: PageMeta {
+                            page,
+                            limit,
+                            totalItems: total_items,
+                            totalPages: total_pages,
+                        },
+                    }),
+                ));
+            }
 
-    let mut select_cols = String::from(
-        r#"
+            let mut select_cols = String::from(
+                r#"
 SELECT
   t.id,
   t.project_id,
   t.timestamp,
   t.name,
-        "#,
-    );
-    if fields.io {
-        select_cols.push_str("  t.input,\n  t.output,\n");
-    } else {
-        select_cols.push_str("  NULL::jsonb AS input,\n  NULL::jsonb AS output,\n");
-    }
-    select_cols.push_str(
-        r#"  t.session_id,
+                "#,
+            );
+            if fields.io {
+                select_cols.push_str("  t.input,\n  t.output,\n");
+            } else {
+                select_cols.push_str("  NULL::jsonb AS input,\n  NULL::jsonb AS output,\n");
+            }
+            select_cols.push_str(
+                r#"  t.session_id,
   t.release,
   t.version,
   t.user_id,
 "#,
-    );
-    if fields.io {
-        select_cols.push_str("  t.metadata,\n");
-    } else {
-        select_cols.push_str("  NULL::jsonb AS metadata,\n");
-    }
-    select_cols.push_str(
-        r#"  t.tags,
+            );
+            if fields.io {
+                select_cols.push_str("  t.metadata,\n");
+            } else {
+                select_cols.push_str("  NULL::jsonb AS metadata,\n");
+            }
+            select_cols.push_str(
+                r#"  t.tags,
   t.public,
   t.external_id,
   t.bookmarked,
   t.environment,
 "#,
-    );
-    if fields.metrics {
-        select_cols.push_str("  t.latency,\n  t.total_cost,\n");
-    } else {
-        select_cols.push_str(
-            "  NULL::double precision AS latency,\n  NULL::double precision AS total_cost,\n",
-        );
-    }
-    select_cols.push_str("  t.created_at,\n  t.updated_at,\n");
-    if fields.observations {
-        select_cols.push_str(
-            "  COALESCE((SELECT array_agg(id) FROM observations WHERE trace_id = t.id), '{}') AS observations\n",
-        );
-    } else {
-        select_cols.push_str("  '{}'::uuid[] AS observations\n");
-    }
-    select_cols.push_str(
-        r#"FROM (
+            );
+            if fields.metrics {
+                select_cols.push_str("  t.latency,\n  t.total_cost,\n");
+            } else {
+                select_cols.push_str(
+                    "  NULL::double precision AS latency,\n  NULL::double precision AS total_cost,\n",
+                );
+            }
+            select_cols.push_str("  t.created_at,\n  t.updated_at,\n");
+            if fields.observations {
+                select_cols.push_str(
+                    "  COALESCE((SELECT array_agg(id) FROM observations WHERE trace_id = t.id), '{}') AS observations\n",
+                );
+            } else {
+                select_cols.push_str("  '{}'::uuid[] AS observations\n");
+            }
+            select_cols.push_str(
+                r#"FROM (
   SELECT *
   FROM traces t
   WHERE 1=1
-        "#,
-    );
+                "#,
+            );
 
-    let mut builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(&select_cols);
+            let mut builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(&select_cols);
 
-    builder.push(" AND t.project_id = ");
-    builder.push_bind(project_id);
+            builder.push(" AND t.project_id = ");
+            builder.push_bind(&project_id);
 
-    apply_trace_filters(&mut builder, &q);
+            apply_trace_filters(&mut builder, &q);
 
-    builder.push(" ORDER BY ");
-    builder.push(order_column);
-    builder.push(if order_desc { " DESC" } else { " ASC" });
-    builder.push(" LIMIT ");
-    builder.push_bind(limit);
-    builder.push(" OFFSET ");
-    builder.push_bind(offset);
+            builder.push(" ORDER BY ");
+            builder.push(order_column);
+            builder.push(if order_desc { " DESC" } else { " ASC" });
+            builder.push(" LIMIT ");
+            builder.push_bind(limit);
+            builder.push(" OFFSET ");
+            builder.push_bind(offset);
 
-    builder.push(") t");
+            builder.push(") t");
 
-    let rows: Vec<TraceListRow> = builder.build_query_as().fetch_all(&state.pool).await?;
+            let rows: Vec<TraceListRow> = builder.build_query_as().fetch_all(pool).await?;
 
-    let items = rows
-        .into_iter()
-        .map(|r| {
-            let observations = if fields.observations {
-                r.observations
-                    .into_iter()
-                    .map(|id| id.to_string())
-                    .collect()
-            } else {
-                vec![]
-            };
-            let scores = if fields.scores {
-                Vec::new()
-            } else {
-                Vec::with_capacity(0)
-            };
+            let items = rows
+                .into_iter()
+                .map(|r| {
+                    let observations = if fields.observations {
+                        r.observations
+                            .into_iter()
+                            .map(|id| id.to_string())
+                            .collect()
+                    } else {
+                        vec![]
+                    };
+                    let scores = if fields.scores {
+                        Vec::new()
+                    } else {
+                        Vec::with_capacity(0)
+                    };
 
-            let latency = if fields.metrics {
-                r.latency
-            } else {
-                Some(-1.0)
-            };
-            let total_cost = if fields.metrics {
-                r.total_cost
-            } else {
-                Some(-1.0)
-            };
+                    let latency = if fields.metrics {
+                        r.latency
+                    } else {
+                        Some(-1.0)
+                    };
+                    let total_cost = if fields.metrics {
+                        r.total_cost
+                    } else {
+                        Some(-1.0)
+                    };
 
-            TraceListItem {
-                html_path: format!("/project/{}/traces/{}", r.project_id, r.id),
-                id: r.id,
-                timestamp: r.timestamp,
-                name: r.name,
-                input: if fields.io {
-                    Some(r.input.unwrap_or(JsonValue::Null))
+                    TraceListItem {
+                        html_path: format!("/project/{}/traces/{}", r.project_id, r.id),
+                        id: r.id,
+                        timestamp: r.timestamp,
+                        name: r.name,
+                        input: if fields.io {
+                            Some(r.input.unwrap_or(JsonValue::Null))
+                        } else {
+                            None
+                        },
+                        output: if fields.io {
+                            Some(r.output.unwrap_or(JsonValue::Null))
+                        } else {
+                            None
+                        },
+                        session_id: r.session_id,
+                        release: r.release,
+                        version: r.version,
+                        user_id: r.user_id,
+                        metadata: if fields.io {
+                            Some(r.metadata.unwrap_or(JsonValue::Null))
+                        } else {
+                            None
+                        },
+                        tags: r.tags,
+                        public: r.public,
+                        project_id: r.project_id,
+                        external_id: r.external_id,
+                        bookmarked: r.bookmarked,
+                        environment: r.environment,
+                        latency,
+                        total_cost,
+                        created_at: r.created_at,
+                        updated_at: r.updated_at,
+                        observations,
+                        scores,
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            Ok((
+                StatusCode::OK,
+                Json(PagedData {
+                    data: items,
+                    meta: PageMeta {
+                        page,
+                        limit,
+                        totalItems: total_items,
+                        totalPages: total_pages,
+                    },
+                }),
+            ))
+        }
+        crate::state::DatabaseConnection::Memory(mem_db) => {
+            let mut filtered: Vec<crate::state::TraceRow> = mem_db
+                .traces
+                .iter()
+                .map(|item| item.value().clone())
+                .filter(|t| {
+                    if t.project_id != project_id {
+                        return false;
+                    }
+                    if let Some(ref u_id) = q.user_id {
+                        if t.user_id.as_ref() != Some(u_id) {
+                            return false;
+                        }
+                    }
+                    if let Some(ref name) = q.name {
+                        if t.name.as_ref() != Some(name) {
+                            return false;
+                        }
+                    }
+                    if let Some(ref s_id) = q.session_id {
+                        if t.session_id.as_ref() != Some(s_id) {
+                            return false;
+                        }
+                    }
+                    if let Some(ref from_ts) = q.from_timestamp {
+                        if t.timestamp < *from_ts {
+                            return false;
+                        }
+                    }
+                    if let Some(ref to_ts) = q.to_timestamp {
+                        if t.timestamp > *to_ts {
+                            return false;
+                        }
+                    }
+                    if !q.tags.is_empty() {
+                        if !q.tags.iter().all(|tag| t.tags.contains(tag)) {
+                            return false;
+                        }
+                    }
+                    if let Some(ref version) = q.version {
+                        if t.version.as_ref() != Some(version) {
+                            return false;
+                        }
+                    }
+                    if let Some(ref release) = q.release {
+                        if t.release.as_ref() != Some(release) {
+                            return false;
+                        }
+                    }
+                    if !q.environment.is_empty() {
+                        if !q.environment.contains(&t.environment) {
+                            return false;
+                        }
+                    }
+                    true
+                })
+                .collect();
+
+            filtered.sort_by(|a, b| {
+                let ord = match order_column {
+                    "t.id" => a.id.cmp(&b.id),
+                    "t.timestamp" => a.timestamp.cmp(&b.timestamp),
+                    "t.name" => a.name.cmp(&b.name),
+                    "t.user_id" => a.user_id.cmp(&b.user_id),
+                    "t.release" => a.release.cmp(&b.release),
+                    "t.version" => a.version.cmp(&b.version),
+                    "t.public" => a.public.cmp(&b.public),
+                    "t.bookmarked" => a.bookmarked.cmp(&b.bookmarked),
+                    "t.session_id" => a.session_id.cmp(&b.session_id),
+                    "t.latency" => {
+                        let a_lat = a.latency.unwrap_or(0.0);
+                        let b_lat = b.latency.unwrap_or(0.0);
+                        a_lat.partial_cmp(&b_lat).unwrap_or(std::cmp::Ordering::Equal)
+                    }
+                    "t.total_cost" => {
+                        let a_cost = a.total_cost.unwrap_or(0.0);
+                        let b_cost = b.total_cost.unwrap_or(0.0);
+                        a_cost.partial_cmp(&b_cost).unwrap_or(std::cmp::Ordering::Equal)
+                    }
+                    _ => a.timestamp.cmp(&b.timestamp),
+                };
+                if order_desc {
+                    ord.reverse()
                 } else {
-                    None
-                },
-                output: if fields.io {
-                    Some(r.output.unwrap_or(JsonValue::Null))
-                } else {
-                    None
-                },
-                session_id: r.session_id,
-                release: r.release,
-                version: r.version,
-                user_id: r.user_id,
-                metadata: if fields.io {
-                    Some(r.metadata.unwrap_or(JsonValue::Null))
-                } else {
-                    None
-                },
-                tags: r.tags,
-                public: r.public,
-                project_id: r.project_id,
-                external_id: r.external_id,
-                bookmarked: r.bookmarked,
-                environment: r.environment,
-                latency,
-                total_cost,
-                created_at: r.created_at,
-                updated_at: r.updated_at,
-                observations,
-                scores,
+                    ord
+                }
+            });
+
+            let total_items = filtered.len() as i64;
+            let total_pages = if total_items == 0 {
+                0
+            } else {
+                (total_items + limit - 1) / limit
+            };
+            let paged: Vec<crate::state::TraceRow> = filtered
+                .into_iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .collect();
+
+            let mut trace_obs_ids: std::collections::HashMap<Uuid, Vec<Uuid>> = std::collections::HashMap::new();
+            if fields.observations {
+                for entry in mem_db.observations.iter() {
+                    let obs = entry.value();
+                    trace_obs_ids.entry(obs.trace_id).or_default().push(obs.id);
+                }
             }
-        })
-        .collect::<Vec<_>>();
 
-    Ok((
-        StatusCode::OK,
-        Json(PagedData {
-            data: items,
-            meta: PageMeta {
-                page,
-                limit,
-                totalItems: total_items,
-                totalPages: total_pages,
-            },
-        }),
-    ))
+            let items: Vec<TraceListItem> = paged
+                .into_iter()
+                .map(|r| {
+                    let observations = if fields.observations {
+                        trace_obs_ids
+                            .get(&r.id)
+                            .cloned()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|id| id.to_string())
+                            .collect()
+                    } else {
+                        vec![]
+                    };
+
+                    TraceListItem {
+                        html_path: format!("/project/{}/traces/{}", r.project_id, r.id),
+                        id: r.id,
+                        timestamp: r.timestamp,
+                        name: r.name,
+                        input: if fields.io {
+                            Some(r.input.unwrap_or(JsonValue::Null))
+                        } else {
+                            None
+                        },
+                        output: if fields.io {
+                            Some(r.output.unwrap_or(JsonValue::Null))
+                        } else {
+                            None
+                        },
+                        session_id: r.session_id,
+                        release: r.release,
+                        version: r.version,
+                        user_id: r.user_id,
+                        metadata: if fields.io {
+                            Some(r.metadata.unwrap_or(JsonValue::Null))
+                        } else {
+                            None
+                        },
+                        tags: r.tags,
+                        public: r.public,
+                        project_id: r.project_id,
+                        external_id: r.external_id,
+                        bookmarked: r.bookmarked,
+                        environment: r.environment,
+                        latency: if fields.metrics {
+                            r.latency
+                        } else {
+                            Some(-1.0)
+                        },
+                        total_cost: if fields.metrics {
+                            r.total_cost
+                        } else {
+                            Some(-1.0)
+                        },
+                        created_at: r.created_at,
+                        updated_at: r.updated_at,
+                        observations,
+                        scores: vec![],
+                    }
+                })
+                .collect();
+
+            Ok((
+                StatusCode::OK,
+                Json(PagedData {
+                    data: items,
+                    meta: PageMeta {
+                        page,
+                        limit,
+                        totalItems: total_items,
+                        totalPages: total_pages,
+                    },
+                }),
+            ))
+        }
+    }
+}
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -672,8 +861,12 @@ pub(crate) async fn get_trace(
     State(state): State<AppState>,
     Path(trace_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let trace: Option<TraceRow> = sqlx::query_as(
-        r#"
+    let project_id = state.default_project_id.as_ref();
+
+    match &state.db {
+        crate::state::DatabaseConnection::Postgres(pool) => {
+            let trace: Option<TraceRow> = sqlx::query_as(
+                r#"
 SELECT
   id,
   timestamp,
@@ -697,19 +890,19 @@ SELECT
   updated_at
 FROM traces
 WHERE id = $1 AND project_id = $2
-         "#,
-    )
-    .bind(trace_id)
-    .bind(state.default_project_id.as_ref())
-    .fetch_optional(&state.pool)
-    .await?;
+                 "#,
+            )
+            .bind(trace_id)
+            .bind(project_id)
+            .fetch_optional(pool)
+            .await?;
 
-    let Some(trace) = trace else {
-        return Err(ApiError::NotFound);
-    };
+            let Some(trace) = trace else {
+                return Err(ApiError::NotFound);
+            };
 
-    let observations: Vec<ObservationRow> = sqlx::query_as(
-        r#"
+            let observations: Vec<ObservationRow> = sqlx::query_as(
+                r#"
 SELECT
   id,
   trace_id,
@@ -750,109 +943,233 @@ SELECT
 FROM observations
 WHERE trace_id = $1 AND project_id = $2
 ORDER BY start_time NULLS LAST, created_at
-         "#,
-    )
-    .bind(trace_id)
-    .bind(state.default_project_id.as_ref())
-    .fetch_all(&state.pool)
-    .await?;
+                 "#,
+            )
+            .bind(trace_id)
+            .bind(project_id)
+            .fetch_all(pool)
+            .await?;
 
-    let obs_dtos = observations
-        .into_iter()
-        .map(|o| {
-            let prompt_tokens = o.prompt_tokens.unwrap_or(0);
-            let completion_tokens = o.completion_tokens.unwrap_or(0);
-            let total_tokens = o.total_tokens.unwrap_or(0);
-            let calculated_input_cost = o.calculated_input_cost.unwrap_or(0.0);
-            let calculated_output_cost = o.calculated_output_cost.unwrap_or(0.0);
-            let calculated_total_cost = o.calculated_total_cost.unwrap_or(0.0);
+            let obs_dtos = observations
+                .into_iter()
+                .map(|o| {
+                    let prompt_tokens = o.prompt_tokens.unwrap_or(0);
+                    let completion_tokens = o.completion_tokens.unwrap_or(0);
+                    let total_tokens = o.total_tokens.unwrap_or(0);
+                    let calculated_input_cost = o.calculated_input_cost.unwrap_or(0.0);
+                    let calculated_output_cost = o.calculated_output_cost.unwrap_or(0.0);
+                    let calculated_total_cost = o.calculated_total_cost.unwrap_or(0.0);
 
-            ObservationsViewDto {
-                version: None,
-                id: o.id,
-                trace_id: Some(o.trace_id),
-                r#type: o.r#type,
-                name: o.name,
-                start_time: o.start_time.unwrap_or(o.created_at),
-                end_time: o.end_time,
-                completion_start_time: o.completion_start_time,
-                model: o.model,
-                model_parameters: o.model_parameters.unwrap_or_else(|| serde_json::json!({})),
-                input: o.input.unwrap_or(JsonValue::Null),
-                metadata: o.metadata.unwrap_or(JsonValue::Null),
-                output: o.output.unwrap_or(JsonValue::Null),
-                usage: PublicUsage {
-                    input: prompt_tokens,
-                    output: completion_tokens,
-                    total: total_tokens,
-                    unit: o.unit.clone(),
-                    input_cost: o.calculated_input_cost,
-                    output_cost: o.calculated_output_cost,
-                    total_cost: o.calculated_total_cost,
-                },
-                usage_details: serde_json::json!({
-                    "input": prompt_tokens,
-                    "output": completion_tokens,
-                    "total": total_tokens
-                }),
-                cost_details: serde_json::json!({
-                    "input": calculated_input_cost,
-                    "output": calculated_output_cost,
-                    "total": calculated_total_cost
-                }),
-                level: o.level.unwrap_or_else(|| "DEFAULT".to_string()),
-                status_message: o.status_message,
-                parent_observation_id: o.parent_observation_id,
-                prompt_id: o.prompt_id,
-                prompt_name: o.prompt_name,
-                prompt_version: o
-                    .prompt_version
-                    .as_deref()
-                    .and_then(|s| s.parse::<i64>().ok()),
-                model_id: o.model_id,
-                input_price: o.input_price,
-                output_price: o.output_price,
-                total_price: o.total_price,
-                calculated_input_cost: o.calculated_input_cost,
-                calculated_output_cost: o.calculated_output_cost,
-                calculated_total_cost: o.calculated_total_cost,
-                latency: o.latency,
-                time_to_first_token: o.time_to_first_token,
-                prompt_tokens,
-                completion_tokens,
-                total_tokens,
-                environment: o.environment,
-            }
-        })
-        .collect::<Vec<_>>();
+                    ObservationsViewDto {
+                        version: None,
+                        id: o.id,
+                        trace_id: Some(o.trace_id),
+                        r#type: o.r#type,
+                        name: o.name,
+                        start_time: o.start_time.unwrap_or(o.created_at),
+                        end_time: o.end_time,
+                        completion_start_time: o.completion_start_time,
+                        model: o.model,
+                        model_parameters: o.model_parameters.unwrap_or_else(|| serde_json::json!({})),
+                        input: o.input.unwrap_or(JsonValue::Null),
+                        metadata: o.metadata.unwrap_or(JsonValue::Null),
+                        output: o.output.unwrap_or(JsonValue::Null),
+                        usage: PublicUsage {
+                            input: prompt_tokens,
+                            output: completion_tokens,
+                            total: total_tokens,
+                            unit: o.unit.clone(),
+                            input_cost: o.calculated_input_cost,
+                            output_cost: o.calculated_output_cost,
+                            total_cost: o.calculated_total_cost,
+                        },
+                        usage_details: serde_json::json!({
+                            "input": prompt_tokens,
+                            "output": completion_tokens,
+                            "total": total_tokens
+                        }),
+                        cost_details: serde_json::json!({
+                            "input": calculated_input_cost,
+                            "output": calculated_output_cost,
+                            "total": calculated_total_cost
+                        }),
+                        level: o.level.unwrap_or_else(|| "DEFAULT".to_string()),
+                        status_message: o.status_message,
+                        parent_observation_id: o.parent_observation_id,
+                        prompt_id: o.prompt_id,
+                        prompt_name: o.prompt_name,
+                        prompt_version: o
+                            .prompt_version
+                            .as_deref()
+                            .and_then(|s| s.parse::<i64>().ok()),
+                        model_id: o.model_id,
+                        input_price: o.input_price,
+                        output_price: o.output_price,
+                        total_price: o.total_price,
+                        calculated_input_cost: o.calculated_input_cost,
+                        calculated_output_cost: o.calculated_output_cost,
+                        calculated_total_cost: o.calculated_total_cost,
+                        latency: o.latency,
+                        time_to_first_token: o.time_to_first_token,
+                        prompt_tokens,
+                        completion_tokens,
+                        total_tokens,
+                        environment: o.environment,
+                    }
+                })
+                .collect::<Vec<_>>();
 
-    let dto = TraceDetailDto {
-        html_path: format!("/project/{}/traces/{}", trace.project_id, trace.id),
-        scores: vec![],
-        id: trace.id,
-        timestamp: trace.timestamp,
-        name: trace.name,
-        input: trace.input.unwrap_or(JsonValue::Null),
-        output: trace.output.unwrap_or(JsonValue::Null),
-        session_id: trace.session_id,
-        release: trace.release,
-        version: trace.version,
-        user_id: trace.user_id,
-        metadata: trace.metadata.unwrap_or(JsonValue::Null),
-        tags: trace.tags,
-        public: trace.public,
-        project_id: trace.project_id,
-        external_id: trace.external_id,
-        bookmarked: trace.bookmarked,
-        environment: trace.environment,
-        latency: trace.latency,
-        total_cost: trace.total_cost,
-        created_at: trace.created_at,
-        updated_at: trace.updated_at,
-        observations: obs_dtos,
-    };
+            let dto = TraceDetailDto {
+                html_path: format!("/project/{}/traces/{}", trace.project_id, trace.id),
+                scores: vec![],
+                id: trace.id,
+                timestamp: trace.timestamp,
+                name: trace.name,
+                input: trace.input.unwrap_or(JsonValue::Null),
+                output: trace.output.unwrap_or(JsonValue::Null),
+                session_id: trace.session_id,
+                release: trace.release,
+                version: trace.version,
+                user_id: trace.user_id,
+                metadata: trace.metadata.unwrap_or(JsonValue::Null),
+                tags: trace.tags,
+                public: trace.public,
+                project_id: trace.project_id,
+                external_id: trace.external_id,
+                bookmarked: trace.bookmarked,
+                environment: trace.environment,
+                latency: trace.latency,
+                total_cost: trace.total_cost,
+                created_at: trace.created_at,
+                updated_at: trace.updated_at,
+                observations: obs_dtos,
+            };
 
-    Ok((StatusCode::OK, Json(dto)))
+            Ok((StatusCode::OK, Json(dto)))
+        }
+        crate::state::DatabaseConnection::Memory(mem_db) => {
+            let trace = mem_db
+                .traces
+                .get(&trace_id)
+                .map(|item| item.value().clone())
+                .filter(|t| t.project_id == project_id);
+
+            let Some(trace) = trace else {
+                return Err(ApiError::NotFound);
+            };
+
+            let mut observations: Vec<crate::state::ObservationRow> = mem_db
+                .observations
+                .iter()
+                .map(|item| item.value().clone())
+                .filter(|o| o.trace_id == trace_id && o.project_id == project_id)
+                .collect();
+
+            observations.sort_by(|a, b| {
+                let a_time = a.start_time.unwrap_or(a.created_at);
+                let b_time = b.start_time.unwrap_or(b.created_at);
+                a_time.cmp(&b_time).then_with(|| a.created_at.cmp(&b.created_at))
+            });
+
+            let obs_dtos = observations
+                .into_iter()
+                .map(|o| {
+                    let prompt_tokens = o.prompt_tokens.unwrap_or(0);
+                    let completion_tokens = o.completion_tokens.unwrap_or(0);
+                    let total_tokens = o.total_tokens.unwrap_or(0);
+                    let calculated_input_cost = o.calculated_input_cost.unwrap_or(0.0);
+                    let calculated_output_cost = o.calculated_output_cost.unwrap_or(0.0);
+                    let calculated_total_cost = o.calculated_total_cost.unwrap_or(0.0);
+
+                    ObservationsViewDto {
+                        version: None,
+                        id: o.id,
+                        trace_id: Some(o.trace_id),
+                        r#type: o.r#type,
+                        name: o.name,
+                        start_time: o.start_time.unwrap_or(o.created_at),
+                        end_time: o.end_time,
+                        completion_start_time: o.completion_start_time,
+                        model: o.model,
+                        model_parameters: o.model_parameters.unwrap_or_else(|| serde_json::json!({})),
+                        input: o.input.unwrap_or(JsonValue::Null),
+                        metadata: o.metadata.unwrap_or(JsonValue::Null),
+                        output: o.output.unwrap_or(JsonValue::Null),
+                        usage: PublicUsage {
+                            input: prompt_tokens,
+                            output: completion_tokens,
+                            total: total_tokens,
+                            unit: o.unit.clone(),
+                            input_cost: o.calculated_input_cost,
+                            output_cost: o.calculated_output_cost,
+                            total_cost: o.calculated_total_cost,
+                        },
+                        usage_details: serde_json::json!({
+                            "input": prompt_tokens,
+                            "output": completion_tokens,
+                            "total": total_tokens
+                        }),
+                        cost_details: serde_json::json!({
+                            "input": calculated_input_cost,
+                            "output": calculated_output_cost,
+                            "total": calculated_total_cost
+                        }),
+                        level: o.level.unwrap_or_else(|| "DEFAULT".to_string()),
+                        status_message: o.status_message,
+                        parent_observation_id: o.parent_observation_id,
+                        prompt_id: o.prompt_id,
+                        prompt_name: o.prompt_name,
+                        prompt_version: o
+                            .prompt_version
+                            .as_deref()
+                            .and_then(|s| s.parse::<i64>().ok()),
+                        model_id: o.model_id,
+                        input_price: o.input_price,
+                        output_price: o.output_price,
+                        total_price: o.total_price,
+                        calculated_input_cost: o.calculated_input_cost,
+                        calculated_output_cost: o.calculated_output_cost,
+                        calculated_total_cost: o.calculated_total_cost,
+                        latency: o.latency,
+                        time_to_first_token: o.time_to_first_token,
+                        prompt_tokens,
+                        completion_tokens,
+                        total_tokens,
+                        environment: o.environment,
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            let dto = TraceDetailDto {
+                html_path: format!("/project/{}/traces/{}", trace.project_id, trace.id),
+                scores: vec![],
+                id: trace.id,
+                timestamp: trace.timestamp,
+                name: trace.name,
+                input: trace.input.unwrap_or(JsonValue::Null),
+                output: trace.output.unwrap_or(JsonValue::Null),
+                session_id: trace.session_id,
+                release: trace.release,
+                version: trace.version,
+                user_id: trace.user_id,
+                metadata: trace.metadata.unwrap_or(JsonValue::Null),
+                tags: trace.tags,
+                public: trace.public,
+                project_id: trace.project_id,
+                external_id: trace.external_id,
+                bookmarked: trace.bookmarked,
+                environment: trace.environment,
+                latency: trace.latency,
+                total_cost: trace.total_cost,
+                created_at: trace.created_at,
+                updated_at: trace.updated_at,
+                observations: obs_dtos,
+            };
+
+            Ok((StatusCode::OK, Json(dto)))
+        }
+    }
+}
 }
 
 #[cfg(test)]
