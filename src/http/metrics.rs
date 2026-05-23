@@ -74,13 +74,6 @@ struct MetricsQueryResponse {
     meta: MetricsQueryMeta,
 }
 
-#[derive(Debug, sqlx::FromRow)]
-struct MetricsQueryRow {
-    bucket_ts: DateTime<Utc>,
-    labels: JsonValue,
-    value: f64,
-}
-
 pub(crate) async fn post_metrics_batch(
     State(state): State<AppState>,
     Json(payload): Json<MetricsBatchRequest>,
@@ -189,8 +182,8 @@ pub(crate) async fn get_metrics_query(
         _ => unreachable!(),
     };
 
-    const MAX_POINTS_PER_SERIES: usize = 1000;
-    const MAX_SERIES: usize = 50;
+    const MAX_POINTS_PER_SERIES: i64 = 1000;
+    const MAX_SERIES: i64 = 50;
 
     let mut builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
         "WITH filtered AS (\n  SELECT\n    to_timestamp(floor(extract(epoch from timestamp) / ",
@@ -214,35 +207,58 @@ pub(crate) async fn get_metrics_query(
         builder.push_bind(f.clone());
     }
 
-    builder.push(")\nSELECT\n  bucket_ts,\n  ");
+    builder.push("),\naggregated AS (\n  SELECT\n    bucket_ts,\n    ");
     if let Some(ref group_key) = q.group_by {
         builder.push("jsonb_build_object(");
         builder.push_bind(group_key.clone());
         builder.push(", labels ->> ");
         builder.push_bind(group_key.clone());
-        builder.push(") AS labels,\n  ");
+        builder.push(") AS labels,\n    ");
     } else {
-        builder.push("labels,\n  ");
+        builder.push("labels,\n    ");
     }
     builder.push(agg_expr);
-    builder.push(" AS value\nFROM filtered\nGROUP BY bucket_ts, ");
+    builder.push(" AS value\n  FROM filtered\n  GROUP BY bucket_ts, ");
     if let Some(ref group_key) = q.group_by {
         builder.push("labels ->> ");
         builder.push_bind(group_key.clone());
-        builder.push("\nORDER BY labels ->> ");
-        builder.push_bind(group_key.clone());
     } else {
-        builder.push("labels\nORDER BY labels");
+        builder.push("labels");
     }
-    builder.push(", bucket_ts ASC");
+    builder.push(
+        "\n),\nranked AS (\n  SELECT\n    bucket_ts,\n    labels,\n    value,\n    ROW_NUMBER() OVER (PARTITION BY labels ORDER BY bucket_ts ASC) AS point_rank,\n    DENSE_RANK() OVER (ORDER BY labels) AS series_rank\n  FROM aggregated\n)\nSELECT\n  bucket_ts,\n  labels,\n  value,\n  point_rank,\n  series_rank\nFROM ranked\nWHERE point_rank <= ",
+    );
+    builder.push_bind(MAX_POINTS_PER_SERIES);
+    builder.push(" AND series_rank <= ");
+    builder.push_bind(MAX_SERIES);
+    builder.push("\nORDER BY labels, bucket_ts ASC");
 
-    let rows: Vec<MetricsQueryRow> = builder.build_query_as().fetch_all(&state.pool).await?;
+    #[derive(Debug, sqlx::FromRow)]
+    struct MetricsQueryLimitedRow {
+        bucket_ts: DateTime<Utc>,
+        labels: JsonValue,
+        value: f64,
+        point_rank: i64,
+        series_rank: i64,
+    }
+
+    let rows: Vec<MetricsQueryLimitedRow> = builder.build_query_as().fetch_all(&state.pool).await?;
 
     let mut series_map: BTreeMap<String, MetricsSeries> = BTreeMap::new();
     let mut points_truncated = false;
+    let mut series_truncated = false;
     let mut latest_bucket: Option<DateTime<Utc>> = None;
 
     for r in rows {
+        if r.point_rank > MAX_POINTS_PER_SERIES {
+            points_truncated = true;
+            continue;
+        }
+        if r.series_rank > MAX_SERIES {
+            series_truncated = true;
+            continue;
+        }
+
         match latest_bucket {
             Some(prev) if r.bucket_ts > prev => latest_bucket = Some(r.bucket_ts),
             None => latest_bucket = Some(r.bucket_ts),
@@ -255,21 +271,13 @@ pub(crate) async fn get_metrics_query(
             values: Vec::new(),
         });
 
-        if entry.values.len() < MAX_POINTS_PER_SERIES {
-            entry.values.push(MetricValuePoint {
-                timestamp: r.bucket_ts.to_rfc3339(),
-                value: r.value,
-            });
-        } else {
-            points_truncated = true;
-        }
+        entry.values.push(MetricValuePoint {
+            timestamp: r.bucket_ts.to_rfc3339(),
+            value: r.value,
+        });
     }
 
-    let mut data = series_map.into_values().collect::<Vec<_>>();
-    let series_truncated = data.len() > MAX_SERIES;
-    if series_truncated {
-        data.truncate(MAX_SERIES);
-    }
+    let data = series_map.into_values().collect::<Vec<_>>();
 
     let meta = MetricsQueryMeta {
         latest_ts: latest_bucket.map(|ts| ts.to_rfc3339()),
@@ -507,7 +515,7 @@ async fn write_metrics_batches(
     let mut builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
         "INSERT INTO metrics (project_id, environment, name, labels, value, timestamp) ",
     );
-    builder.push_values(points.into_iter(), |mut b, m| {
+    builder.push_values(points, |mut b, m| {
         b.push_bind(default_project_id.to_string())
             .push_bind("default".to_string())
             .push_bind(m.name)

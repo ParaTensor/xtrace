@@ -2,14 +2,17 @@ use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
-use sqlx::PgPool;
-use std::sync::Arc;
+use sqlx::{PgPool, QueryBuilder};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 use tokio::{sync::mpsc, time::Duration};
 use uuid::Uuid;
 
 use crate::{
     http::{common::ApiResponse, error::ApiError},
-    state::AppState,
+    state::{AppState, IngestStats},
 };
 
 #[derive(Debug, Deserialize)]
@@ -149,20 +152,84 @@ pub(crate) struct ObservationIngest {
     pub projectId: Option<String>,
 }
 
+struct ResolvedTrace {
+    id: Uuid,
+    project_id: String,
+    environment: String,
+    timestamp: DateTime<Utc>,
+    name: Option<String>,
+    input: Option<JsonValue>,
+    output: Option<JsonValue>,
+    session_id: Option<String>,
+    release: Option<String>,
+    version: Option<String>,
+    user_id: Option<String>,
+    metadata: Option<JsonValue>,
+    tags: Vec<String>,
+    public: bool,
+    external_id: Option<String>,
+    bookmarked: bool,
+    latency: Option<f64>,
+    total_cost: Option<f64>,
+}
+
+struct ResolvedObservation {
+    id: Uuid,
+    trace_id: Uuid,
+    project_id: String,
+    environment: String,
+    obs_type: String,
+    name: Option<String>,
+    start_time: Option<DateTime<Utc>>,
+    end_time: Option<DateTime<Utc>>,
+    completion_start_time: Option<DateTime<Utc>>,
+    model: Option<String>,
+    model_parameters: Option<JsonValue>,
+    input: Option<JsonValue>,
+    output: Option<JsonValue>,
+    usage: Option<JsonValue>,
+    level: Option<String>,
+    status_message: Option<String>,
+    parent_observation_id: Option<Uuid>,
+    prompt_id: Option<String>,
+    prompt_name: Option<String>,
+    prompt_version: Option<String>,
+    model_id: Option<String>,
+    input_price: Option<f64>,
+    output_price: Option<f64>,
+    total_price: Option<f64>,
+    calculated_input_cost: Option<f64>,
+    calculated_output_cost: Option<f64>,
+    calculated_total_cost: Option<f64>,
+    latency: Option<f64>,
+    time_to_first_token: Option<f64>,
+    completion_tokens: Option<i64>,
+    prompt_tokens: Option<i64>,
+    total_tokens: Option<i64>,
+    unit: Option<String>,
+    metadata: Option<JsonValue>,
+}
+
 pub(crate) async fn post_batch(
     State(state): State<AppState>,
     Json(payload): Json<BatchIngestRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     match state.ingest_tx.try_send(payload) {
-        Ok(()) => Ok((
-            StatusCode::OK,
-            Json(ApiResponse::<serde_json::Value> {
-                message: "Request Successful.".to_string(),
-                code: None,
-                data: None,
-            }),
-        )),
-        Err(mpsc::error::TrySendError::Full(_)) => Err(ApiError::TooManyRequests),
+        Ok(()) => {
+            state.ingest_stats.record_enqueued(1);
+            Ok((
+                StatusCode::OK,
+                Json(ApiResponse::<serde_json::Value> {
+                    message: "Request Successful.".to_string(),
+                    code: None,
+                    data: None,
+                }),
+            ))
+        }
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            state.ingest_stats.record_queue_rejected(1);
+            Err(ApiError::TooManyRequests)
+        }
         Err(mpsc::error::TrySendError::Closed(_)) => Err(ApiError::ServiceUnavailable),
     }
 }
@@ -171,6 +238,7 @@ pub(crate) async fn ingest_worker(
     pool: PgPool,
     default_project_id: Arc<str>,
     mut rx: mpsc::Receiver<BatchIngestRequest>,
+    stats: Arc<IngestStats>,
 ) {
     const MAX_BATCHES: usize = 200;
     let window = Duration::from_millis(50);
@@ -194,9 +262,91 @@ pub(crate) async fn ingest_worker(
             }
         }
 
-        if let Err(err) = write_batches(&pool, default_project_id.as_ref(), batches).await {
-            tracing::error!(error = ?err, "failed to write batch");
+        let item_count = batches
+            .iter()
+            .map(|b| b.trace.as_ref().map(|_| 1).unwrap_or(0) + b.observations.len())
+            .sum::<usize>() as u64;
+
+        match write_batches(&pool, default_project_id.as_ref(), batches).await {
+            Ok(()) => {
+                stats.record_batches_written(1);
+                stats.record_items_written(item_count);
+            }
+            Err(err) => {
+                stats.record_batches_failed(1);
+                tracing::error!(error = ?err, "failed to write batch");
+            }
         }
+    }
+}
+
+fn resolve_trace(
+    trace: TraceIngest,
+    default_project_id: &str,
+    now: DateTime<Utc>,
+) -> ResolvedTrace {
+    ResolvedTrace {
+        id: trace.id,
+        project_id: trace
+            .projectId
+            .unwrap_or_else(|| default_project_id.to_string()),
+        environment: trace.environment.unwrap_or_else(|| "default".to_string()),
+        timestamp: trace.timestamp.unwrap_or(now),
+        name: trace.name,
+        input: trace.input,
+        output: trace.output,
+        session_id: trace.session_id,
+        release: trace.release,
+        version: trace.version,
+        user_id: trace.userId,
+        metadata: trace.metadata,
+        tags: trace.tags,
+        public: trace.public.unwrap_or(false),
+        external_id: trace.externalId,
+        bookmarked: trace.bookmarked.unwrap_or(false),
+        latency: trace.latency,
+        total_cost: trace.totalCost,
+    }
+}
+
+fn resolve_observation(obs: ObservationIngest, default_project_id: &str) -> ResolvedObservation {
+    ResolvedObservation {
+        id: obs.id,
+        trace_id: obs.traceId,
+        project_id: obs
+            .projectId
+            .unwrap_or_else(|| default_project_id.to_string()),
+        environment: obs.environment.unwrap_or_else(|| "default".to_string()),
+        obs_type: obs.r#type.unwrap_or_else(|| "GENERATION".to_string()),
+        name: obs.name,
+        start_time: obs.startTime,
+        end_time: obs.endTime,
+        completion_start_time: obs.completionStartTime,
+        model: obs.model,
+        model_parameters: obs.modelParameters,
+        input: obs.input,
+        output: obs.output,
+        usage: obs.usage,
+        level: obs.level,
+        status_message: obs.statusMessage,
+        parent_observation_id: obs.parentObservationId,
+        prompt_id: obs.promptId,
+        prompt_name: obs.promptName,
+        prompt_version: obs.promptVersion,
+        model_id: obs.modelId,
+        input_price: obs.inputPrice,
+        output_price: obs.outputPrice,
+        total_price: obs.totalPrice,
+        calculated_input_cost: obs.calculatedInputCost,
+        calculated_output_cost: obs.calculatedOutputCost,
+        calculated_total_cost: obs.calculatedTotalCost,
+        latency: obs.latency,
+        time_to_first_token: obs.timeToFirstToken,
+        completion_tokens: obs.completionTokens,
+        prompt_tokens: obs.promptTokens,
+        total_tokens: obs.totalTokens,
+        unit: obs.unit,
+        metadata: obs.metadata,
     }
 }
 
@@ -205,36 +355,83 @@ async fn write_batches(
     default_project_id: &str,
     payloads: Vec<BatchIngestRequest>,
 ) -> Result<(), sqlx::Error> {
-    let mut tx = pool.begin().await?;
-    for payload in payloads {
-        write_one(&mut tx, default_project_id, payload).await?;
+    if payloads.is_empty() {
+        return Ok(());
     }
-    tx.commit().await?;
-    Ok(())
-}
 
-async fn write_one(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    default_project_id: &str,
-    payload: BatchIngestRequest,
-) -> Result<(), sqlx::Error> {
     let now = Utc::now();
+    let mut traces: Vec<ResolvedTrace> = Vec::new();
+    let mut observations: Vec<ResolvedObservation> = Vec::new();
+    let mut placeholders: HashMap<Uuid, (String, String)> = HashMap::new();
 
-    if let Some(trace) = payload.trace {
-        let project_id = trace.projectId.as_deref().unwrap_or(default_project_id);
-        let timestamp = trace.timestamp.unwrap_or(now);
-        let environment = trace.environment.unwrap_or_else(|| "default".to_string());
+    for payload in payloads {
+        if let Some(trace) = payload.trace {
+            traces.push(resolve_trace(trace, default_project_id, now));
+        }
+        for obs in payload.observations {
+            let resolved = resolve_observation(obs, default_project_id);
+            placeholders
+                .entry(resolved.trace_id)
+                .or_insert((resolved.project_id.clone(), resolved.environment.clone()));
+            observations.push(resolved);
+        }
+    }
 
-        sqlx::query(
-            r#"
-INSERT INTO traces (
+    let mut tx = pool.begin().await?;
+
+    if !placeholders.is_empty() {
+        let mut builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
+            "INSERT INTO traces (id, project_id, environment, timestamp, created_at, updated_at) ",
+        );
+        builder.push_values(
+            placeholders.iter(),
+            |mut b, (trace_id, (project_id, env))| {
+                b.push_bind(*trace_id)
+                    .push_bind(project_id.clone())
+                    .push_bind(env.clone())
+                    .push_bind(now)
+                    .push_bind(now)
+                    .push_bind(now);
+            },
+        );
+        builder.push(" ON CONFLICT (id) DO NOTHING");
+        builder.build().execute(&mut *tx).await?;
+    }
+
+    if !traces.is_empty() {
+        let mut seen = HashSet::new();
+        traces.retain(|trace| seen.insert(trace.id));
+
+        let mut builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
+            r#"INSERT INTO traces (
   id, project_id, environment, timestamp, name, input, output, session_id, release, version, user_id,
   metadata, tags, public, external_id, bookmarked, latency, total_cost, created_at, updated_at
-) VALUES (
-  $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-  $11, $12, $13, $14, $15, $16, $17, $18, NOW(), NOW()
-)
-ON CONFLICT (id) DO UPDATE SET
+) "#,
+        );
+        builder.push_values(traces.iter(), |mut b, trace| {
+            b.push_bind(trace.id)
+                .push_bind(trace.project_id.clone())
+                .push_bind(trace.environment.clone())
+                .push_bind(trace.timestamp)
+                .push_bind(trace.name.clone())
+                .push_bind(trace.input.clone())
+                .push_bind(trace.output.clone())
+                .push_bind(trace.session_id.clone())
+                .push_bind(trace.release.clone())
+                .push_bind(trace.version.clone())
+                .push_bind(trace.user_id.clone())
+                .push_bind(trace.metadata.clone())
+                .push_bind(trace.tags.clone())
+                .push_bind(trace.public)
+                .push_bind(trace.external_id.clone())
+                .push_bind(trace.bookmarked)
+                .push_bind(trace.latency)
+                .push_bind(trace.total_cost)
+                .push_bind(now)
+                .push_bind(now);
+        });
+        builder.push(
+            r#" ON CONFLICT (id) DO UPDATE SET
   project_id = EXCLUDED.project_id,
   environment = EXCLUDED.environment,
   timestamp = EXCLUDED.timestamp,
@@ -252,51 +449,17 @@ ON CONFLICT (id) DO UPDATE SET
   bookmarked = EXCLUDED.bookmarked,
   latency = EXCLUDED.latency,
   total_cost = EXCLUDED.total_cost,
-  updated_at = NOW()
-            "#,
-        )
-        .bind(trace.id)
-        .bind(project_id.to_string())
-        .bind(environment.clone())
-        .bind(timestamp)
-        .bind(trace.name.clone())
-        .bind(trace.input.clone())
-        .bind(trace.output.clone())
-        .bind(trace.session_id.clone())
-        .bind(trace.release.clone())
-        .bind(trace.version.clone())
-        .bind(trace.userId.clone())
-        .bind(trace.metadata.clone())
-        .bind(trace.tags.clone())
-        .bind(trace.public.unwrap_or(false))
-        .bind(trace.externalId.clone())
-        .bind(trace.bookmarked.unwrap_or(false))
-        .bind(trace.latency)
-        .bind(trace.totalCost)
-        .execute(&mut **tx)
-        .await?;
+  updated_at = NOW()"#,
+        );
+        builder.build().execute(&mut *tx).await?;
     }
 
-    for obs in payload.observations {
-        let project_id = obs.projectId.as_deref().unwrap_or(default_project_id);
-        let environment = obs.environment.unwrap_or_else(|| "default".to_string());
+    if !observations.is_empty() {
+        let mut seen = HashSet::new();
+        observations.retain(|obs| seen.insert(obs.id));
 
-        sqlx::query(
-            r#"
-INSERT INTO traces (id, project_id, environment, timestamp, created_at, updated_at)
-VALUES ($1, $2, $3, NOW(), NOW(), NOW())
-ON CONFLICT (id) DO NOTHING
-            "#,
-        )
-        .bind(obs.traceId)
-        .bind(project_id.to_string())
-        .bind(environment.clone())
-        .execute(&mut **tx)
-        .await?;
-
-        sqlx::query(
-            r#"
-INSERT INTO observations (
+        let mut builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
+            r#"INSERT INTO observations (
   id, trace_id, type, name, start_time, end_time, completion_start_time,
   model, model_parameters, input, output, usage, level, status_message,
   parent_observation_id, prompt_id, prompt_name, prompt_version, model_id,
@@ -305,17 +468,48 @@ INSERT INTO observations (
   latency, time_to_first_token,
   completion_tokens, prompt_tokens, total_tokens, unit,
   metadata, environment, project_id, created_at, updated_at
-) VALUES (
-  $1, $2, $3, $4, $5, $6, $7,
-  $8, $9, $10, $11, $12, $13, $14,
-  $15, $16, $17, $18, $19,
-  $20, $21, $22,
-  $23, $24, $25,
-  $26, $27,
-  $28, $29, $30, $31,
-  $32, $33, $34, NOW(), NOW()
-)
-ON CONFLICT (id) DO UPDATE SET
+) "#,
+        );
+        builder.push_values(observations.iter(), |mut b, obs| {
+            b.push_bind(obs.id)
+                .push_bind(obs.trace_id)
+                .push_bind(obs.obs_type.clone())
+                .push_bind(obs.name.clone())
+                .push_bind(obs.start_time)
+                .push_bind(obs.end_time)
+                .push_bind(obs.completion_start_time)
+                .push_bind(obs.model.clone())
+                .push_bind(obs.model_parameters.clone())
+                .push_bind(obs.input.clone())
+                .push_bind(obs.output.clone())
+                .push_bind(obs.usage.clone())
+                .push_bind(obs.level.clone())
+                .push_bind(obs.status_message.clone())
+                .push_bind(obs.parent_observation_id)
+                .push_bind(obs.prompt_id.clone())
+                .push_bind(obs.prompt_name.clone())
+                .push_bind(obs.prompt_version.clone())
+                .push_bind(obs.model_id.clone())
+                .push_bind(obs.input_price)
+                .push_bind(obs.output_price)
+                .push_bind(obs.total_price)
+                .push_bind(obs.calculated_input_cost)
+                .push_bind(obs.calculated_output_cost)
+                .push_bind(obs.calculated_total_cost)
+                .push_bind(obs.latency)
+                .push_bind(obs.time_to_first_token)
+                .push_bind(obs.completion_tokens)
+                .push_bind(obs.prompt_tokens)
+                .push_bind(obs.total_tokens)
+                .push_bind(obs.unit.clone())
+                .push_bind(obs.metadata.clone())
+                .push_bind(obs.environment.clone())
+                .push_bind(obs.project_id.clone())
+                .push_bind(now)
+                .push_bind(now);
+        });
+        builder.push(
+            r#" ON CONFLICT (id) DO UPDATE SET
   trace_id = EXCLUDED.trace_id,
   type = EXCLUDED.type,
   name = EXCLUDED.name,
@@ -349,46 +543,11 @@ ON CONFLICT (id) DO UPDATE SET
   metadata = EXCLUDED.metadata,
   environment = EXCLUDED.environment,
   project_id = EXCLUDED.project_id,
-  updated_at = NOW()
-            "#,
-        )
-        .bind(obs.id)
-        .bind(obs.traceId)
-        .bind(obs.r#type.unwrap_or_else(|| "GENERATION".to_string()))
-        .bind(obs.name.clone())
-        .bind(obs.startTime)
-        .bind(obs.endTime)
-        .bind(obs.completionStartTime)
-        .bind(obs.model.clone())
-        .bind(obs.modelParameters.clone())
-        .bind(obs.input.clone())
-        .bind(obs.output.clone())
-        .bind(obs.usage.clone())
-        .bind(obs.level.clone())
-        .bind(obs.statusMessage.clone())
-        .bind(obs.parentObservationId)
-        .bind(obs.promptId.clone())
-        .bind(obs.promptName.clone())
-        .bind(obs.promptVersion.clone())
-        .bind(obs.modelId.clone())
-        .bind(obs.inputPrice)
-        .bind(obs.outputPrice)
-        .bind(obs.totalPrice)
-        .bind(obs.calculatedInputCost)
-        .bind(obs.calculatedOutputCost)
-        .bind(obs.calculatedTotalCost)
-        .bind(obs.latency)
-        .bind(obs.timeToFirstToken)
-        .bind(obs.completionTokens)
-        .bind(obs.promptTokens)
-        .bind(obs.totalTokens)
-        .bind(obs.unit.clone())
-        .bind(obs.metadata.clone())
-        .bind(environment)
-        .bind(project_id.to_string())
-        .execute(&mut **tx)
-        .await?;
+  updated_at = NOW()"#,
+        );
+        builder.build().execute(&mut *tx).await?;
     }
 
+    tx.commit().await?;
     Ok(())
 }

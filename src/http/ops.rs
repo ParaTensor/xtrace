@@ -3,6 +3,29 @@ use std::sync::atomic::Ordering;
 
 use crate::state::AppState;
 
+pub(crate) async fn get_ingest_stats(State(state): State<AppState>) -> impl IntoResponse {
+    let enqueued = state.ingest_stats.enqueued.load(Ordering::Relaxed);
+    let queue_rejected = state.ingest_stats.queue_rejected.load(Ordering::Relaxed);
+    let batches_written = state.ingest_stats.batches_written.load(Ordering::Relaxed);
+    let batches_failed = state.ingest_stats.batches_failed.load(Ordering::Relaxed);
+    let items_written = state.ingest_stats.items_written.load(Ordering::Relaxed);
+
+    let body = serde_json::json!({
+        "enqueued": enqueued,
+        "queue_rejected": queue_rejected,
+        "batches_written": batches_written,
+        "batches_failed": batches_failed,
+        "items_written": items_written,
+        "failure_rate": if batches_written + batches_failed > 0 {
+            batches_failed as f64 / (batches_written + batches_failed) as f64
+        } else {
+            0.0
+        },
+    });
+
+    (StatusCode::OK, Json(body))
+}
+
 pub(crate) async fn get_rate_limit_stats(State(state): State<AppState>) -> impl IntoResponse {
     let total_allowed = state.rate_limit_stats.total_allowed.load(Ordering::Relaxed);
     let total_rejected = state
@@ -16,7 +39,7 @@ pub(crate) async fn get_rate_limit_stats(State(state): State<AppState>) -> impl 
         .iter()
         .map(|entry| (entry.key().clone(), *entry.value()))
         .collect();
-    per_token.sort_by(|a, b| b.1.cmp(&a.1));
+    per_token.sort_by_key(|b| std::cmp::Reverse(b.1));
 
     let top = per_token
         .into_iter()

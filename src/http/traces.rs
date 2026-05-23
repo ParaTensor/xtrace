@@ -57,6 +57,25 @@ pub(crate) struct TraceListQuery {
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
+struct TraceListRowCore {
+    id: Uuid,
+    project_id: String,
+    timestamp: DateTime<Utc>,
+    name: Option<String>,
+    session_id: Option<String>,
+    release: Option<String>,
+    version: Option<String>,
+    user_id: Option<String>,
+    tags: Vec<String>,
+    public: bool,
+    external_id: Option<String>,
+    bookmarked: bool,
+    environment: String,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
 struct TraceListRow {
     id: Uuid,
     project_id: String,
@@ -220,11 +239,12 @@ pub(crate) async fn get_traces(
 
     let fields = parse_trace_fields(q.fields.as_deref());
     let (order_column, order_desc) = parse_order_by(q.order_by.as_deref())?;
+    let project_id = state.default_project_id.to_string();
 
     let mut count_builder: QueryBuilder<'_, sqlx::Postgres> =
         QueryBuilder::new("SELECT COUNT(*)::BIGINT AS cnt FROM traces t WHERE 1=1");
     count_builder.push(" AND t.project_id = ");
-    count_builder.push_bind(state.default_project_id.to_string());
+    count_builder.push_bind(project_id.clone());
     apply_trace_filters(&mut count_builder, &q);
 
     let total_items: i64 = count_builder
@@ -238,39 +258,150 @@ pub(crate) async fn get_traces(
         (total_items + limit - 1) / limit
     };
 
-    let mut builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
+    if !fields.io && !fields.observations && !fields.metrics {
+        let mut builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
+            r#"
+SELECT
+  t.id,
+  t.project_id,
+  t.timestamp,
+  t.name,
+  t.session_id,
+  t.release,
+  t.version,
+  t.user_id,
+  t.tags,
+  t.public,
+  t.external_id,
+  t.bookmarked,
+  t.environment,
+  t.created_at,
+  t.updated_at
+FROM (
+  SELECT *
+  FROM traces t
+  WHERE 1=1
+            "#,
+        );
+
+        builder.push(" AND t.project_id = ");
+        builder.push_bind(project_id.clone());
+        apply_trace_filters(&mut builder, &q);
+        builder.push(" ORDER BY ");
+        builder.push(order_column);
+        builder.push(if order_desc { " DESC" } else { " ASC" });
+        builder.push(" LIMIT ");
+        builder.push_bind(limit);
+        builder.push(" OFFSET ");
+        builder.push_bind(offset);
+        builder.push(") t");
+
+        let rows: Vec<TraceListRowCore> = builder.build_query_as().fetch_all(&state.pool).await?;
+
+        let items = rows
+            .into_iter()
+            .map(|r| TraceListItem {
+                html_path: format!("/project/{}/traces/{}", r.project_id, r.id),
+                id: r.id,
+                timestamp: r.timestamp,
+                name: r.name,
+                input: None,
+                output: None,
+                session_id: r.session_id,
+                release: r.release,
+                version: r.version,
+                user_id: r.user_id,
+                metadata: None,
+                tags: r.tags,
+                public: r.public,
+                project_id: r.project_id,
+                external_id: r.external_id,
+                bookmarked: r.bookmarked,
+                environment: r.environment,
+                latency: Some(-1.0),
+                total_cost: Some(-1.0),
+                created_at: r.created_at,
+                updated_at: r.updated_at,
+                observations: vec![],
+                scores: vec![],
+            })
+            .collect::<Vec<_>>();
+
+        return Ok((
+            StatusCode::OK,
+            Json(PagedData {
+                data: items,
+                meta: PageMeta {
+                    page,
+                    limit,
+                    totalItems: total_items,
+                    totalPages: total_pages,
+                },
+            }),
+        ));
+    }
+
+    let mut select_cols = String::from(
         r#"
 SELECT
   t.id,
   t.project_id,
   t.timestamp,
   t.name,
-  t.input,
-  t.output,
-  t.session_id,
+        "#,
+    );
+    if fields.io {
+        select_cols.push_str("  t.input,\n  t.output,\n");
+    } else {
+        select_cols.push_str("  NULL::jsonb AS input,\n  NULL::jsonb AS output,\n");
+    }
+    select_cols.push_str(
+        r#"  t.session_id,
   t.release,
   t.version,
   t.user_id,
-  t.metadata,
-  t.tags,
+"#,
+    );
+    if fields.io {
+        select_cols.push_str("  t.metadata,\n");
+    } else {
+        select_cols.push_str("  NULL::jsonb AS metadata,\n");
+    }
+    select_cols.push_str(
+        r#"  t.tags,
   t.public,
   t.external_id,
   t.bookmarked,
   t.environment,
-  t.latency,
-  t.total_cost,
-  t.created_at,
-  t.updated_at,
-  COALESCE((SELECT array_agg(id) FROM observations WHERE trace_id = t.id), '{}') AS observations
-FROM (
+"#,
+    );
+    if fields.metrics {
+        select_cols.push_str("  t.latency,\n  t.total_cost,\n");
+    } else {
+        select_cols.push_str(
+            "  NULL::double precision AS latency,\n  NULL::double precision AS total_cost,\n",
+        );
+    }
+    select_cols.push_str("  t.created_at,\n  t.updated_at,\n");
+    if fields.observations {
+        select_cols.push_str(
+            "  COALESCE((SELECT array_agg(id) FROM observations WHERE trace_id = t.id), '{}') AS observations\n",
+        );
+    } else {
+        select_cols.push_str("  '{}'::uuid[] AS observations\n");
+    }
+    select_cols.push_str(
+        r#"FROM (
   SELECT *
   FROM traces t
   WHERE 1=1
         "#,
     );
 
+    let mut builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(&select_cols);
+
     builder.push(" AND t.project_id = ");
-    builder.push_bind(state.default_project_id.to_string());
+    builder.push_bind(project_id);
 
     apply_trace_filters(&mut builder, &q);
 
@@ -565,10 +696,11 @@ SELECT
   created_at,
   updated_at
 FROM traces
-WHERE id = $1
+WHERE id = $1 AND project_id = $2
          "#,
     )
     .bind(trace_id)
+    .bind(state.default_project_id.as_ref())
     .fetch_optional(&state.pool)
     .await?;
 
@@ -616,11 +748,12 @@ SELECT
   created_at,
   updated_at
 FROM observations
-WHERE trace_id = $1
+WHERE trace_id = $1 AND project_id = $2
 ORDER BY start_time NULLS LAST, created_at
          "#,
     )
     .bind(trace_id)
+    .bind(state.default_project_id.as_ref())
     .fetch_all(&state.pool)
     .await?;
 
@@ -720,4 +853,48 @@ ORDER BY start_time NULLS LAST, created_at
     };
 
     Ok((StatusCode::OK, Json(dto)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_trace_fields_defaults_to_all() {
+        let mask = parse_trace_fields(None);
+        assert!(mask.io);
+        assert!(mask.scores);
+        assert!(mask.observations);
+        assert!(mask.metrics);
+    }
+
+    #[test]
+    fn parse_trace_fields_core_excludes_heavy_fields() {
+        let mask = parse_trace_fields(Some("core"));
+        assert!(!mask.io);
+        assert!(!mask.scores);
+        assert!(!mask.observations);
+        assert!(!mask.metrics);
+    }
+
+    #[test]
+    fn parse_trace_fields_partial_selection() {
+        let mask = parse_trace_fields(Some("io,metrics"));
+        assert!(mask.io);
+        assert!(!mask.scores);
+        assert!(!mask.observations);
+        assert!(mask.metrics);
+    }
+
+    #[test]
+    fn parse_order_by_accepts_timestamp_desc() {
+        let (col, desc) = parse_order_by(Some("timestamp.desc")).unwrap();
+        assert_eq!(col, "t.timestamp");
+        assert!(desc);
+    }
+
+    #[test]
+    fn parse_order_by_rejects_unknown_column() {
+        assert!(parse_order_by(Some("unknown.asc")).is_err());
+    }
 }

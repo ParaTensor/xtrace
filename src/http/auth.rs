@@ -145,3 +145,52 @@ pub(crate) async fn rate_limit(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    fn header(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(value).expect("valid header"),
+        );
+        headers
+    }
+
+    #[test]
+    fn extract_bearer_token() {
+        let headers = header("Bearer secret-token");
+        match extract_auth(&headers).unwrap() {
+            AuthHeader::Bearer(token) => assert_eq!(token, "secret-token"),
+            _ => panic!("expected bearer"),
+        }
+    }
+
+    #[test]
+    fn extract_basic_credentials() {
+        let encoded = BASE64_STANDARD.encode("pk-test:sk-test");
+        let headers = header(&format!("Basic {encoded}"));
+        match extract_auth(&headers).unwrap() {
+            AuthHeader::Basic { username, password } => {
+                assert_eq!(username, "pk-test");
+                assert_eq!(password, "sk-test");
+            }
+            _ => panic!("expected basic"),
+        }
+    }
+
+    #[test]
+    fn extract_auth_rejects_missing_header() {
+        assert!(extract_auth(&HeaderMap::new()).is_err());
+    }
+
+    #[test]
+    fn extract_client_key_masks_bearer_prefix() {
+        let headers = header("Bearer very-long-secret-token");
+        let key = extract_client_key(&headers);
+        assert!(key.starts_with("bearer:very-lon"));
+    }
+}

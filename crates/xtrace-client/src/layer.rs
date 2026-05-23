@@ -127,9 +127,7 @@ impl XtraceLayer {
     /// Create a new XtraceLayer and spawn the background flusher.
     pub fn new(client: Client) -> Self {
         let (tx, rx) = mpsc::sync_channel(1000);
-        let inner = Arc::new(XtraceLayerInner {
-            tx,
-        });
+        let inner = Arc::new(XtraceLayerInner { tx });
 
         let client = client.clone();
         std::thread::spawn(move || {
@@ -264,7 +262,8 @@ where
             .and_then(|mut s| s.remove(&key));
 
         let (duration_secs, span_name) = {
-            let opt = ctx.span(&id)
+            let opt = ctx
+                .span(&id)
                 .and_then(|span| span.extensions_mut().remove::<SpanRecord>())
                 .map(|rec| (rec.created_at.elapsed().as_secs_f64(), rec.name));
             if let Some(res) = opt {

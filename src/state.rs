@@ -16,6 +16,58 @@ pub struct RateLimitStats {
     pub per_token_rejected: dashmap::DashMap<String, u64>,
 }
 
+pub struct IngestStats {
+    pub enqueued: AtomicU64,
+    pub queue_rejected: AtomicU64,
+    pub batches_written: AtomicU64,
+    pub batches_failed: AtomicU64,
+    pub items_written: AtomicU64,
+}
+
+impl Default for IngestStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl IngestStats {
+    pub fn new() -> Self {
+        Self {
+            enqueued: AtomicU64::new(0),
+            queue_rejected: AtomicU64::new(0),
+            batches_written: AtomicU64::new(0),
+            batches_failed: AtomicU64::new(0),
+            items_written: AtomicU64::new(0),
+        }
+    }
+
+    pub fn record_enqueued(&self, count: u64) {
+        self.enqueued.fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub fn record_queue_rejected(&self, count: u64) {
+        self.queue_rejected.fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub fn record_batches_written(&self, count: u64) {
+        self.batches_written.fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub fn record_batches_failed(&self, count: u64) {
+        self.batches_failed.fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub fn record_items_written(&self, count: u64) {
+        self.items_written.fetch_add(count, Ordering::Relaxed);
+    }
+}
+
+impl Default for RateLimitStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RateLimitStats {
     pub fn new() -> Self {
         Self {
@@ -74,10 +126,11 @@ pub struct AppState {
     pub langfuse_public_key: Option<Arc<str>>,
     pub langfuse_secret_key: Option<Arc<str>>,
     pub default_project_id: Arc<str>,
-    pub ingest_tx: mpsc::Sender<BatchIngestRequest>,
-    pub metrics_tx: mpsc::Sender<MetricsBatchRequest>,
+    pub(crate) ingest_tx: mpsc::Sender<BatchIngestRequest>,
+    pub(crate) metrics_tx: mpsc::Sender<MetricsBatchRequest>,
     pub query_limiter: Arc<KeyedRateLimiter>,
     pub rate_limit_stats: Arc<RateLimitStats>,
+    pub ingest_stats: Arc<IngestStats>,
     pub rate_limit_qps: u32,
     pub rate_limit_burst: u32,
     pub allow_unauthenticated_compat: bool,
