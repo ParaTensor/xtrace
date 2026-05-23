@@ -11,11 +11,42 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
+    let mock_storage = std::env::var("XTRACE_MOCK_STORAGE")
+        .map(|s| s == "true")
+        .unwrap_or(false);
+    let json_dir_env = std::env::var("XTRACE_JSON_DIR").ok();
+    let is_mock = mock_storage || json_dir_env.is_some();
+
+    let database_url = match std::env::var("DATABASE_URL") {
+        Ok(url) => url,
+        Err(_) => {
+            if is_mock {
+                "postgres://dummy_mock_url".to_string()
+            } else {
+                return Err(anyhow::anyhow!("missing env DATABASE_URL"));
+            }
+        }
+    };
+
+    let api_bearer_token = match std::env::var("API_BEARER_TOKEN") {
+        Ok(token) => token,
+        Err(_) => {
+            if is_mock {
+                let default_token = "xtrace-default-token".to_string();
+                tracing::warn!(
+                    "API_BEARER_TOKEN is not set. Defaulting to '{}' for mock storage mode.",
+                    default_token
+                );
+                default_token
+            } else {
+                return Err(anyhow::anyhow!("missing env API_BEARER_TOKEN"));
+            }
+        }
+    };
+
     let config = ServerConfig {
-        database_url: std::env::var("DATABASE_URL")
-            .map_err(|_| anyhow::anyhow!("missing env DATABASE_URL"))?,
-        api_bearer_token: std::env::var("API_BEARER_TOKEN")
-            .map_err(|_| anyhow::anyhow!("missing env API_BEARER_TOKEN"))?,
+        database_url,
+        api_bearer_token,
         bind_addr: std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8742".to_string()),
         default_project_id: std::env::var("DEFAULT_PROJECT_ID")
             .unwrap_or_else(|_| "default".to_string()),
