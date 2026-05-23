@@ -24,3 +24,8 @@ frontend/node_modules/
 xtrace-aarch64
 xtrace-temp-container
 
+# Local storage and logs
+.xtrace_data/
+*.log
+
+
