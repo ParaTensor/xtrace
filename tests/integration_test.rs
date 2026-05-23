@@ -245,43 +245,7 @@ async fn metrics_overview_returns_count_and_latency() {
 
 async fn setup_mock_app() -> (axum::Router, String) {
     let token = "mock-test-token".to_string();
-    let mem_db = std::sync::Arc::new(xtrace::state::MemoryDb::new(None));
-    let db_conn = xtrace::state::DatabaseConnection::Memory(mem_db);
-
-    let (ingest_tx, ingest_rx) = tokio::sync::mpsc::channel(1000);
-    let (metrics_tx, metrics_rx) = tokio::sync::mpsc::channel(5000);
-    let ingest_stats = std::sync::Arc::new(xtrace::state::IngestStats::new());
-    let default_project_id: std::sync::Arc<str> = std::sync::Arc::from("default");
-
-    tokio::spawn(xtrace::ingest::batch::ingest_worker(
-        db_conn.clone(),
-        default_project_id.clone(),
-        ingest_rx,
-        ingest_stats.clone(),
-    ));
-    tokio::spawn(xtrace::http::metrics::metrics_worker(
-        db_conn.clone(),
-        default_project_id.clone(),
-        metrics_rx,
-    ));
-
-    let state = xtrace::state::AppState {
-        db: db_conn,
-        api_bearer_token: std::sync::Arc::from(token.as_str()),
-        langfuse_public_key: None,
-        langfuse_secret_key: None,
-        default_project_id,
-        ingest_tx,
-        metrics_tx,
-        query_limiter: xtrace::state::AppState::build_limiter(100, 200),
-        rate_limit_stats: std::sync::Arc::new(xtrace::state::RateLimitStats::new()),
-        ingest_stats,
-        rate_limit_qps: 100,
-        rate_limit_burst: 200,
-        allow_unauthenticated_compat: false,
-    };
-
-    let router = xtrace::app::build_router(state, 20 * 1024 * 1024);
+    let router = xtrace::test_app::setup_mock_router(&token).await;
     (router, token)
 }
 

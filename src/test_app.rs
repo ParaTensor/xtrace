@@ -60,3 +60,45 @@ pub async fn setup_test_router(
 
     Ok(build_router(state, 20 * 1024 * 1024))
 }
+
+/// Build an in-memory mock router for integration tests.
+#[doc(hidden)]
+pub async fn setup_mock_router(bearer_token: &str) -> Router {
+    let mem_db = Arc::new(crate::state::MemoryDb::new(None));
+    let db_conn = crate::state::DatabaseConnection::Memory(mem_db);
+
+    let (ingest_tx, ingest_rx) = mpsc::channel::<BatchIngestRequest>(1000);
+    let (metrics_tx, metrics_rx) = mpsc::channel::<MetricsBatchRequest>(5000);
+    let ingest_stats = Arc::new(IngestStats::new());
+    let default_project_id: Arc<str> = Arc::from("default");
+
+    tokio::spawn(ingest_worker(
+        db_conn.clone(),
+        default_project_id.clone(),
+        ingest_rx,
+        ingest_stats.clone(),
+    ));
+    tokio::spawn(metrics_worker(
+        db_conn.clone(),
+        default_project_id.clone(),
+        metrics_rx,
+    ));
+
+    let state = AppState {
+        db: db_conn,
+        api_bearer_token: Arc::from(bearer_token),
+        langfuse_public_key: None,
+        langfuse_secret_key: None,
+        default_project_id,
+        ingest_tx,
+        metrics_tx,
+        query_limiter: AppState::build_limiter(100, 200),
+        rate_limit_stats: Arc::new(RateLimitStats::new()),
+        ingest_stats,
+        rate_limit_qps: 100,
+        rate_limit_burst: 200,
+        allow_unauthenticated_compat: false,
+    };
+
+    build_router(state, 20 * 1024 * 1024)
+}
