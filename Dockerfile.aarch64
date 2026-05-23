@@ -1,0 +1,34 @@
+# ==========================================
+# Stage 1: Build aarch64-unknown-linux-musl binary
+# ==========================================
+FROM rust:1.80-slim as builder
+
+# Install essential build dependencies and cross-compilation toolchain for aarch64 musl
+RUN apt-get update && apt-get install -y \
+    musl-tools \
+    gcc-aarch64-linux-gnu \
+    libc6-dev-arm64-cross \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN rustup target add aarch64-unknown-linux-musl
+
+WORKDIR /usr/src/xtrace
+COPY . .
+
+# Set linker and compiler environment variables for the cross compilation target
+ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
+ENV CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc
+
+# Build the release binary targeting static ARMv8 MUSL
+RUN cargo build --release --target aarch64-unknown-linux-musl
+
+# ==========================================
+# Stage 2: Packaging into a minimal deployment container
+# ==========================================
+FROM alpine:3.18
+
+WORKDIR /app
+COPY --from=builder /usr/src/xtrace/target/aarch64-unknown-linux-musl/release/xtrace .
+
+EXPOSE 8080
+ENTRYPOINT ["./xtrace"]
