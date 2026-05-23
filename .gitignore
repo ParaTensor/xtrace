@@ -19,3 +19,8 @@ www/.vitepress/cache/
 
 # Frontend app
 frontend/node_modules/
+
+# Local compiled binaries
+xtrace-aarch64
+xtrace-temp-container
+
