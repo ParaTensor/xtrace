@@ -61,7 +61,7 @@ pub async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
         .unwrap_or(false);
     let json_dir_env = std::env::var("XTRACE_JSON_DIR").ok();
 
-    let db_conn = if mock_storage || json_dir_env.is_ok() {
+    let db_conn = if mock_storage || json_dir_env.is_some() {
         let dir = json_dir_env
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| std::path::PathBuf::from("./.xtrace_data"));

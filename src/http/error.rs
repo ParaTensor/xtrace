@@ -13,14 +13,22 @@ pub enum ApiError {
     TooManyRequests,
     #[error("service unavailable")]
     ServiceUnavailable,
+    #[error("internal error: {0}")]
+    Internal(String),
     #[error(transparent)]
     Sqlx(#[from] sqlx::Error),
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
-        if let ApiError::Sqlx(err) = &self {
-            tracing::error!(error = %err, "sqlx error");
+        match &self {
+            ApiError::Sqlx(err) => {
+                tracing::error!(error = %err, "sqlx error");
+            }
+            ApiError::Internal(err) => {
+                tracing::error!(error = %err, "internal error");
+            }
+            _ => {}
         }
 
         let (status, code, msg) = match self {
@@ -35,6 +43,11 @@ impl IntoResponse for ApiError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "SERVICE_UNAVAILABLE",
                 "Service Unavailable".to_string(),
+            ),
+            ApiError::Internal(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                "Internal Error".to_string(),
             ),
             ApiError::Sqlx(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,

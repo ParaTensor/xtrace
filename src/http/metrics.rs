@@ -7,7 +7,7 @@ use axum::{
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use sqlx::{PgPool, QueryBuilder};
+use sqlx::QueryBuilder;
 use std::{
     collections::{BTreeMap, HashMap},
     sync::Arc,

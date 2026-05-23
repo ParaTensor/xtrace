@@ -31,22 +31,32 @@ pub async fn healthz() -> impl IntoResponse {
     StatusCode::OK
 }
 
-/// Readiness probe: verifies PostgreSQL connectivity. Unauthenticated (for orchestrators).
 pub async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
-    match sqlx::query_scalar::<_, i32>("SELECT 1")
-        .fetch_one(&state.pool)
-        .await
-    {
-        Ok(_) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "status": "ready" })),
-        )
-            .into_response(),
-        Err(e) => {
-            tracing::error!(error = %e, "readyz: database check failed");
+    match &state.db {
+        crate::state::DatabaseConnection::Postgres(pool) => {
+            match sqlx::query_scalar::<_, i32>("SELECT 1")
+                .fetch_one(pool)
+                .await
+            {
+                Ok(_) => (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "status": "ready" })),
+                )
+                    .into_response(),
+                Err(e) => {
+                    tracing::error!(error = %e, "readyz: database check failed");
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({ "status": "not_ready" })),
+                    )
+                        .into_response()
+                }
+            }
+        }
+        crate::state::DatabaseConnection::Memory(_) => {
             (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({ "status": "not_ready" })),
+                StatusCode::OK,
+                Json(serde_json::json!({ "status": "ready" })),
             )
                 .into_response()
         }
