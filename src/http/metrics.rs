@@ -528,3 +528,133 @@ async fn write_metrics_batches(
     tx.commit().await?;
     Ok(())
 }
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct MetricsOverviewQuery {
+    pub(crate) query: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MetricsOverviewQueryConfig {
+    view: String,
+    from_timestamp: Option<DateTime<Utc>>,
+    to_timestamp: Option<DateTime<Utc>>,
+    #[serde(default)]
+    metrics: Vec<MetricSpec>,
+    #[serde(default)]
+    dimensions: Vec<DimensionSpec>,
+    #[serde(default)]
+    filters: Vec<FilterSpec>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MetricSpec {
+    measure: String,
+    #[serde(default)]
+    aggregation: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DimensionSpec {
+    field: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct FilterSpec {
+    #[serde(rename = "type", default)]
+    filter_type: String,
+    #[serde(default)]
+    column: String,
+    #[serde(default)]
+    operator: String,
+    #[serde(default)]
+    value: String,
+}
+
+pub(crate) async fn get_metrics_overview(
+    State(state): State<AppState>,
+    Query(q): Query<MetricsOverviewQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let config: MetricsOverviewQueryConfig = serde_json::from_str(&q.query)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+
+    let project_id = state.default_project_id.to_string();
+    let from_ts = config.from_timestamp.unwrap_or_else(|| Utc::now() - chrono::Duration::days(365));
+    let to_ts = config.to_timestamp.unwrap_or_else(|| Utc::now());
+
+    if config.view == "traces" {
+        let row: (i64, f64, f64, f64) = sqlx::query_as(
+            r#"
+SELECT
+  COUNT(*)::BIGINT,
+  COALESCE(AVG(latency), 0.0) * 1000.0,
+  COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY latency), 0.0) * 1000.0,
+  COALESCE(percentile_cont(0.99) WITHIN GROUP (ORDER BY latency), 0.0) * 1000.0
+FROM traces
+WHERE project_id = $1 AND timestamp >= $2 AND timestamp <= $3
+            "#,
+        )
+        .bind(project_id)
+        .bind(from_ts)
+        .bind(to_ts)
+        .fetch_one(&state.pool)
+        .await?;
+
+        let res = serde_json::json!({
+            "data": [
+                {
+                    "count_count": row.0,
+                    "avg_latency": row.1,
+                    "p95_latency": row.2,
+                    "p99_latency": row.3,
+                }
+            ]
+        });
+        Ok((StatusCode::OK, Json(res)))
+    } else if config.view == "observations" {
+        let is_error_filter = config
+            .filters
+            .iter()
+            .any(|f| f.column == "level" && f.value == "ERROR");
+
+        if is_error_filter {
+            let rows: Vec<(uuid::Uuid,)> = sqlx::query_as(
+                r#"
+SELECT DISTINCT trace_id
+FROM observations
+WHERE project_id = $1 AND level = 'ERROR' AND start_time >= $2 AND start_time <= $3
+                "#,
+            )
+            .bind(project_id)
+            .bind(from_ts)
+            .bind(to_ts)
+            .fetch_all(&state.pool)
+            .await?;
+
+            let data_list = rows
+                .into_iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "traceId": r.0.to_string()
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            let res = serde_json::json!({
+                "data": data_list
+            });
+            Ok((StatusCode::OK, Json(res)))
+        } else {
+            let res = serde_json::json!({
+                "data": []
+            });
+            Ok((StatusCode::OK, Json(res)))
+        }
+    } else {
+        let res = serde_json::json!({
+            "data": []
+        });
+        Ok((StatusCode::OK, Json(res)))
+    }
+}

@@ -324,6 +324,10 @@ Independent of Langfuse SDK, suitable for direct server requests, gateway forwar
 
 ### Endpoint List
 
+- `GET /api/public/metrics`
+  Returns high-level overview metrics (trace count, latency avg/p95/p99) or observation metrics (distinct trace IDs with error status) over a specified time window.
+  Primary use: Dashboard overview widgets compatibility for integrations (e.g., Xinference's `/v1/l/metric/overview`).
+
 - `GET /api/public/metrics/daily`
   Returns daily aggregated model invocation usage and cost statistics.
   Primary use: daily invocation volume, token usage, and cost analytics.
@@ -338,8 +342,9 @@ Independent of Langfuse SDK, suitable for direct server requests, gateway forwar
 
 ### Endpoint Relationship
 
-| Endpoint                        | Method | Granularity      | Primary Use              |
-| ------------------------------- | ------ | ---------------- | ------------------------ |
+| Endpoint                        | Method | Granularity      | Primary Use          |
+| ------------------------------- | ------ | ---------------- | -------------------- |
+| `/api/public/metrics`           | HTTP   | Overview metrics | Dashboard overview compatibility |
 | `/api/public/metrics/daily`     | HTTP   | Daily aggregation| Usage / cost analytics   |
 | `/api/public/traces`            | HTTP   | Trace list       | Trace query and filtering|
 | `/api/public/traces/{trace_id}` | HTTP   | Single trace detail | Trace debugging and analysis |

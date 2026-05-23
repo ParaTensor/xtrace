@@ -24,6 +24,7 @@ use crate::state::{AppState, IngestStats, RateLimitStats, ServerConfig};
 /// Build the Axum router (used by the server and integration tests).
 pub fn build_router(state: AppState, max_body: usize) -> Router {
     let query_routes = Router::new()
+        .route("/api/public/metrics", get(metrics::get_metrics_overview))
         .route("/api/public/metrics/daily", get(metrics::get_metrics_daily))
         .route("/api/public/metrics/query", get(metrics::get_metrics_query))
         .route("/api/public/metrics/names", get(metrics::get_metrics_names))

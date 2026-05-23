@@ -196,3 +196,49 @@ async fn metrics_query_returns_series() {
         .unwrap();
     assert_eq!(query_response.status(), StatusCode::OK);
 }
+
+fn url_encode_json(val: &Value) -> String {
+    let s = val.to_string();
+    s.replace('{', "%7B")
+        .replace('}', "%7D")
+        .replace('"', "%22")
+        .replace('[', "%5B")
+        .replace(']', "%5D")
+        .replace(':', "%3A")
+        .replace(',', "%2C")
+}
+
+#[tokio::test]
+async fn metrics_overview_returns_count_and_latency() {
+    let (app, token) = setup_app().await;
+
+    // Query overview for traces
+    let query_param = json!({
+        "view": "traces",
+        "fromTimestamp": "2000-01-01T00:00:00Z",
+        "toTimestamp": "3000-01-01T00:00:00Z",
+        "metrics": [{"measure": "count", "aggregation": "count"}]
+    });
+
+    let uri = format!("/api/public/metrics?query={}", url_encode_json(&query_param));
+    let response = app
+        .clone()
+        .oneshot(authed_request("GET", &uri, &token, None))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Query overview for error observations
+    let error_query = json!({
+        "view": "observations",
+        "fromTimestamp": "2000-01-01T00:00:00Z",
+        "toTimestamp": "3000-01-01T00:00:00Z",
+        "filters": [{"column": "level", "value": "ERROR"}]
+    });
+    let error_uri = format!("/api/public/metrics?query={}", url_encode_json(&error_query));
+    let error_response = app
+        .oneshot(authed_request("GET", &error_uri, &token, None))
+        .await
+        .unwrap();
+    assert_eq!(error_response.status(), StatusCode::OK);
+}
