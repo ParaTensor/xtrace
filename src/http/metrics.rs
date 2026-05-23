@@ -536,6 +536,7 @@ pub(crate) struct MetricsOverviewQuery {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 struct MetricsOverviewQueryConfig {
     view: String,
     from_timestamp: Option<DateTime<Utc>>,
@@ -549,6 +550,7 @@ struct MetricsOverviewQueryConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct MetricSpec {
     measure: String,
     #[serde(default)]
@@ -556,11 +558,13 @@ struct MetricSpec {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct DimensionSpec {
     field: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct FilterSpec {
     #[serde(rename = "type", default)]
     filter_type: String,

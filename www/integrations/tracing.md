@@ -6,7 +6,7 @@
 
 ```toml
 [dependencies]
-xtrace-client = { version = "0.1.0", features = ["tracing"] }
+xtrace-client = { version = "0.1.1", features = ["tracing"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

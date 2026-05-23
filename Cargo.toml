@@ -1,6 +1,6 @@
 [package]
 name = "xtrace"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 
 description = "An AI observability service for collecting, storing, and querying traces, spans, and metrics across LLM and agent workflows."

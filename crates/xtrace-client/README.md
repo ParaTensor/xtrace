@@ -8,14 +8,14 @@ Rust HTTP SDK for the [xtrace](https://github.com/lipish/xtrace) observability s
 
 ```toml
 [dependencies]
-xtrace-client = "0.1.0"
+xtrace-client = "0.1.1"
 ```
 
 To enable automatic metric collection via `tracing`:
 
 ```toml
 [dependencies]
-xtrace-client = { version = "0.1.0", features = ["tracing"] }
+xtrace-client = { version = "0.1.1", features = ["tracing"] }
 ```
 
 ## Basic Usage
