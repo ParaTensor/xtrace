@@ -686,7 +686,6 @@ SELECT
         }
     }
 }
-}
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
 #[allow(dead_code)]
@@ -1169,7 +1168,6 @@ ORDER BY start_time NULLS LAST, created_at
             Ok((StatusCode::OK, Json(dto)))
         }
     }
-}
 }
 
 #[cfg(test)]
