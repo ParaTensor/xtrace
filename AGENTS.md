@@ -2,6 +2,19 @@
 
 本仓库是 **xtrace**：自托管的 AI/LLM 可观测后端（Rust + PostgreSQL），带 React 仪表板（`frontend/`）与 VitePress 文档站（`www/`）。权威运行说明见根目录 `README.md`，后端实现约定见 `docs/dev.md`，公共 HTTP 契约见 `docs/api.md`。
 
+## 产品边界与集成原则
+
+xtrace 的定位是 **通用的 AI/LLM observability substrate**：负责接收、存储、查询与展示 traces、observations、metrics，以及少量通用关联元数据。它可以提供统一的 OTLP / HTTP ingest、公共查询接口、基础时序聚合、跨服务 trace 关联能力，但**不是**上层业务系统自身的调度面、路由面、执行面或诊断控制面。
+
+边界上遵守以下原则：
+
+- **保留在 xtrace 核心中的能力**：标准化上下文传播契约、通用 trace/span/observation 关联、通用 streaming lifecycle 观测原语、通用 metrics ingest/query、通用 metadata 存储与检索。
+- **保留在业务系统中的能力**：业务路由与调度策略、节点或引擎生命周期管理、领域特定诊断规则、专属运维解释逻辑、以及仅对单一系统有意义的 adapter / shim / queue 回传实现。
+- **通过命名约定承载领域语义**：领域事件、metadata 和 metric labels 应优先通过命名约定表达，而不是在 xtrace 核心 schema 中固化为专属顶层字段、专属表结构或专属 API。
+- **避免破坏通用性**：不要为单一集成方在核心接口中引入专属数据模型、默认高频落库策略、或与现有兼容面冲突的行为。
+
+如果一个需求要求 xtrace 直接理解某个业务系统的内部状态机、调度语义或运行时细节，默认应将这部分能力保留在业务系统自身实现，而不是放进 xtrace 核心。
+
 修改服务端行为时优先阅读 `src/app.rs` 的路由装配与 `src/http/`、`src/ingest/` 中的现有模式；数据库变更必须新增 `migrations/` 下的顺序迁移并在有数据库的环境下验证 `sqlx migrate`。不要在没有需求时改动 `www/` 与 `frontend/` 的依赖大版本。合并前在本地执行 `cargo fmt --all --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --all`，前端改动则在 `frontend/` 内执行 `npm run lint` 与 `npm run build`（若触及 UI）。
 
 ## 定期更新项目情况（核心例行工作）

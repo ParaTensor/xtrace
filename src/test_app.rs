@@ -42,6 +42,9 @@ pub async fn setup_test_router(
         metrics_rx,
     ));
 
+    let media_dir = std::path::PathBuf::from(".xtrace_test_media");
+    let _ = std::fs::create_dir_all(&media_dir);
+
     let state = AppState {
         db: db_conn,
         api_bearer_token: Arc::from(bearer_token),
@@ -56,6 +59,9 @@ pub async fn setup_test_router(
         rate_limit_qps: 100,
         rate_limit_burst: 200,
         allow_unauthenticated_compat: false,
+        media_dir: Arc::from(media_dir),
+        public_base_url: Some(Arc::from("http://127.0.0.1:8742")),
+        media_max_content_length: 20 * 1024 * 1024,
     };
 
     Ok(build_router(state, 20 * 1024 * 1024))
@@ -84,6 +90,9 @@ pub async fn setup_mock_router(bearer_token: &str) -> Router {
         metrics_rx,
     ));
 
+    let media_dir = std::path::PathBuf::from(".xtrace_test_media");
+    let _ = std::fs::create_dir_all(&media_dir);
+
     let state = AppState {
         db: db_conn,
         api_bearer_token: Arc::from(bearer_token),
@@ -98,6 +107,9 @@ pub async fn setup_mock_router(bearer_token: &str) -> Router {
         rate_limit_qps: 100,
         rate_limit_burst: 200,
         allow_unauthenticated_compat: false,
+        media_dir: Arc::from(media_dir),
+        public_base_url: Some(Arc::from("http://127.0.0.1:8742")),
+        media_max_content_length: 20 * 1024 * 1024,
     };
 
     build_router(state, 20 * 1024 * 1024)

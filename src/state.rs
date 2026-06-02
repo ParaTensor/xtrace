@@ -1,16 +1,16 @@
+use chrono::{DateTime, Utc};
+use dashmap::DashMap;
 use governor::{clock::DefaultClock, Quota};
+use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 use sqlx::PgPool;
 use std::num::NonZeroU32;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::path::PathBuf;
 use std::sync::Mutex;
 use tokio::sync::mpsc;
 use uuid::Uuid;
-use chrono::{DateTime, Utc};
-use serde::{Serialize, Deserialize};
-use serde_json::Value as JsonValue;
-use dashmap::DashMap;
 
 use crate::{http::metrics::MetricsBatchRequest, ingest::batch::BatchIngestRequest};
 
@@ -124,6 +124,12 @@ pub struct ServerConfig {
     pub allow_unauthenticated_compat: bool,
     /// Maximum HTTP request body size in bytes (ingest endpoints).
     pub max_request_body_bytes: usize,
+    /// Directory for Langfuse-compatible media file storage.
+    pub media_dir: PathBuf,
+    /// Optional public base URL (e.g. `https://xtrace.example.com`) for media download links.
+    pub public_base_url: Option<String>,
+    /// Maximum allowed media upload size in bytes.
+    pub media_max_content_length: usize,
 }
 
 #[derive(Clone)]
@@ -141,6 +147,20 @@ pub struct AppState {
     pub rate_limit_qps: u32,
     pub rate_limit_burst: u32,
     pub allow_unauthenticated_compat: bool,
+    pub media_dir: Arc<PathBuf>,
+    pub public_base_url: Option<Arc<str>>,
+    pub media_max_content_length: usize,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct MediaRow {
+    pub id: String,
+    pub project_id: String,
+    pub content_type: String,
+    pub content_length: i64,
+    pub sha256_hash: String,
+    pub uploaded_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
 }
 
 impl AppState {
@@ -236,6 +256,8 @@ pub struct MemoryDb {
     pub traces: DashMap<Uuid, TraceRow>,
     pub observations: DashMap<Uuid, ObservationRow>,
     pub metrics: Mutex<Vec<MetricRow>>,
+    /// Key: `{project_id}:{media_id}`
+    pub media: DashMap<String, MediaRow>,
     pub data_dir: Option<PathBuf>,
 }
 
@@ -245,6 +267,7 @@ impl MemoryDb {
             traces: DashMap::new(),
             observations: DashMap::new(),
             metrics: Mutex::new(Vec::new()),
+            media: DashMap::new(),
             data_dir,
         };
         db.load();
@@ -252,8 +275,10 @@ impl MemoryDb {
     }
 
     fn load(&self) {
-        let Some(ref dir) = self.data_dir else { return; };
-        
+        let Some(ref dir) = self.data_dir else {
+            return;
+        };
+
         let traces_path = dir.join("traces.json");
         if traces_path.exists() {
             if let Ok(file) = std::fs::File::open(&traces_path) {
@@ -264,7 +289,7 @@ impl MemoryDb {
                 }
             }
         }
-        
+
         let obs_path = dir.join("observations.json");
         if obs_path.exists() {
             if let Ok(file) = std::fs::File::open(&obs_path) {
@@ -275,7 +300,7 @@ impl MemoryDb {
                 }
             }
         }
-        
+
         let metrics_path = dir.join("metrics.json");
         if metrics_path.exists() {
             if let Ok(file) = std::fs::File::open(&metrics_path) {
@@ -289,18 +314,28 @@ impl MemoryDb {
     }
 
     pub fn save(&self) {
-        let Some(ref dir) = self.data_dir else { return; };
+        let Some(ref dir) = self.data_dir else {
+            return;
+        };
         let _ = std::fs::create_dir_all(dir);
-        
+
         let traces_path = dir.join("traces.json");
         if let Ok(file) = std::fs::File::create(&traces_path) {
-            let data: Vec<TraceRow> = self.traces.iter().map(|item| item.value().clone()).collect();
+            let data: Vec<TraceRow> = self
+                .traces
+                .iter()
+                .map(|item| item.value().clone())
+                .collect();
             let _ = serde_json::to_writer_pretty(file, &data);
         }
 
         let obs_path = dir.join("observations.json");
         if let Ok(file) = std::fs::File::create(&obs_path) {
-            let data: Vec<ObservationRow> = self.observations.iter().map(|item| item.value().clone()).collect();
+            let data: Vec<ObservationRow> = self
+                .observations
+                .iter()
+                .map(|item| item.value().clone())
+                .collect();
             let _ = serde_json::to_writer_pretty(file, &data);
         }
 

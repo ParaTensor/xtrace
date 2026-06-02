@@ -5,7 +5,7 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sqlx::QueryBuilder;
 use std::collections::HashSet;
@@ -249,10 +249,7 @@ pub(crate) async fn get_traces(
             count_builder.push_bind(project_id.clone());
             apply_trace_filters(&mut count_builder, &q);
 
-            let total_items: i64 = count_builder
-                .build_query_scalar()
-                .fetch_one(pool)
-                .await?;
+            let total_items: i64 = count_builder.build_query_scalar().fetch_one(pool).await?;
 
             let total_pages = if total_items == 0 {
                 0
@@ -572,12 +569,16 @@ SELECT
                     "t.latency" => {
                         let a_lat = a.latency.unwrap_or(0.0);
                         let b_lat = b.latency.unwrap_or(0.0);
-                        a_lat.partial_cmp(&b_lat).unwrap_or(std::cmp::Ordering::Equal)
+                        a_lat
+                            .partial_cmp(&b_lat)
+                            .unwrap_or(std::cmp::Ordering::Equal)
                     }
                     "t.total_cost" => {
                         let a_cost = a.total_cost.unwrap_or(0.0);
                         let b_cost = b.total_cost.unwrap_or(0.0);
-                        a_cost.partial_cmp(&b_cost).unwrap_or(std::cmp::Ordering::Equal)
+                        a_cost
+                            .partial_cmp(&b_cost)
+                            .unwrap_or(std::cmp::Ordering::Equal)
                     }
                     _ => a.timestamp.cmp(&b.timestamp),
                 };
@@ -600,7 +601,8 @@ SELECT
                 .take(limit as usize)
                 .collect();
 
-            let mut trace_obs_ids: std::collections::HashMap<Uuid, Vec<Uuid>> = std::collections::HashMap::new();
+            let mut trace_obs_ids: std::collections::HashMap<Uuid, Vec<Uuid>> =
+                std::collections::HashMap::new();
             if fields.observations {
                 for entry in mem_db.observations.iter() {
                     let obs = entry.value();
@@ -856,11 +858,44 @@ struct ScoreV1Dto {
     string_value: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct GetTraceQuery {
+    #[serde(default)]
+    resolve_media: bool,
+}
+
+async fn resolve_json_value(
+    state: &AppState,
+    project_id: &str,
+    value: JsonValue,
+    enabled: bool,
+) -> JsonValue {
+    if !enabled {
+        return value;
+    }
+    let state = state.clone();
+    let project_id = project_id.to_string();
+    crate::media::resolve_media_references_in_json(
+        &value,
+        &|media_id| {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(
+                    crate::http::media::load_media_bytes_async(&state, &project_id, media_id),
+                )
+            })
+        },
+        10,
+    )
+}
+
 pub(crate) async fn get_trace(
     State(state): State<AppState>,
     Path(trace_id): Path<Uuid>,
+    Query(query): Query<GetTraceQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     let project_id = state.default_project_id.as_ref();
+    let resolve_media = query.resolve_media;
 
     match &state.db {
         crate::state::DatabaseConnection::Postgres(pool) => {
@@ -969,7 +1004,9 @@ ORDER BY start_time NULLS LAST, created_at
                         end_time: o.end_time,
                         completion_start_time: o.completion_start_time,
                         model: o.model,
-                        model_parameters: o.model_parameters.unwrap_or_else(|| serde_json::json!({})),
+                        model_parameters: o
+                            .model_parameters
+                            .unwrap_or_else(|| serde_json::json!({})),
                         input: o.input.unwrap_or(JsonValue::Null),
                         metadata: o.metadata.unwrap_or(JsonValue::Null),
                         output: o.output.unwrap_or(JsonValue::Null),
@@ -1018,7 +1055,7 @@ ORDER BY start_time NULLS LAST, created_at
                 })
                 .collect::<Vec<_>>();
 
-            let dto = TraceDetailDto {
+            let mut dto = TraceDetailDto {
                 html_path: format!("/project/{}/traces/{}", trace.project_id, trace.id),
                 scores: vec![],
                 id: trace.id,
@@ -1043,6 +1080,19 @@ ORDER BY start_time NULLS LAST, created_at
                 updated_at: trace.updated_at,
                 observations: obs_dtos,
             };
+            if resolve_media {
+                dto.input = resolve_json_value(&state, project_id, dto.input, true).await;
+                dto.output = resolve_json_value(&state, project_id, dto.output, true).await;
+                dto.metadata = resolve_json_value(&state, project_id, dto.metadata, true).await;
+                for obs in &mut dto.observations {
+                    obs.input =
+                        resolve_json_value(&state, project_id, obs.input.clone(), true).await;
+                    obs.output =
+                        resolve_json_value(&state, project_id, obs.output.clone(), true).await;
+                    obs.metadata =
+                        resolve_json_value(&state, project_id, obs.metadata.clone(), true).await;
+                }
+            }
 
             Ok((StatusCode::OK, Json(dto)))
         }
@@ -1067,7 +1117,9 @@ ORDER BY start_time NULLS LAST, created_at
             observations.sort_by(|a, b| {
                 let a_time = a.start_time.unwrap_or(a.created_at);
                 let b_time = b.start_time.unwrap_or(b.created_at);
-                a_time.cmp(&b_time).then_with(|| a.created_at.cmp(&b.created_at))
+                a_time
+                    .cmp(&b_time)
+                    .then_with(|| a.created_at.cmp(&b.created_at))
             });
 
             let obs_dtos = observations
@@ -1090,7 +1142,9 @@ ORDER BY start_time NULLS LAST, created_at
                         end_time: o.end_time,
                         completion_start_time: o.completion_start_time,
                         model: o.model,
-                        model_parameters: o.model_parameters.unwrap_or_else(|| serde_json::json!({})),
+                        model_parameters: o
+                            .model_parameters
+                            .unwrap_or_else(|| serde_json::json!({})),
                         input: o.input.unwrap_or(JsonValue::Null),
                         metadata: o.metadata.unwrap_or(JsonValue::Null),
                         output: o.output.unwrap_or(JsonValue::Null),
@@ -1139,7 +1193,7 @@ ORDER BY start_time NULLS LAST, created_at
                 })
                 .collect::<Vec<_>>();
 
-            let dto = TraceDetailDto {
+            let mut dto = TraceDetailDto {
                 html_path: format!("/project/{}/traces/{}", trace.project_id, trace.id),
                 scores: vec![],
                 id: trace.id,
@@ -1164,6 +1218,19 @@ ORDER BY start_time NULLS LAST, created_at
                 updated_at: trace.updated_at,
                 observations: obs_dtos,
             };
+            if resolve_media {
+                dto.input = resolve_json_value(&state, project_id, dto.input, true).await;
+                dto.output = resolve_json_value(&state, project_id, dto.output, true).await;
+                dto.metadata = resolve_json_value(&state, project_id, dto.metadata, true).await;
+                for obs in &mut dto.observations {
+                    obs.input =
+                        resolve_json_value(&state, project_id, obs.input.clone(), true).await;
+                    obs.output =
+                        resolve_json_value(&state, project_id, obs.output.clone(), true).await;
+                    obs.metadata =
+                        resolve_json_value(&state, project_id, obs.metadata.clone(), true).await;
+                }
+            }
 
             Ok((StatusCode::OK, Json(dto)))
         }

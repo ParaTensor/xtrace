@@ -71,6 +71,14 @@ async fn main() -> anyhow::Result<()> {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(20 * 1024 * 1024),
+        media_dir: std::env::var("XTRACE_MEDIA_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from(".xtrace_media")),
+        public_base_url: std::env::var("XTRACE_PUBLIC_BASE_URL").ok(),
+        media_max_content_length: std::env::var("XTRACE_MEDIA_MAX_CONTENT_LENGTH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20 * 1024 * 1024),
     };
 
     run_server(config).await

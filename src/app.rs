@@ -1,7 +1,7 @@
 use axum::{
     extract::DefaultBodyLimit,
     middleware::{self},
-    routing::{get, post},
+    routing::{get, post, put},
     Router,
 };
 use sqlx::postgres::PgPoolOptions;
@@ -12,6 +12,7 @@ use tower_http::trace::TraceLayer;
 use crate::http::common::{healthz, readyz};
 use crate::http::{
     auth::{auth, rate_limit},
+    media,
     metrics::{self, metrics_worker, post_metrics_batch, MetricsBatchRequest},
     ops::{get_ingest_stats, get_rate_limit_stats},
     projects::get_projects,
@@ -36,18 +37,35 @@ pub fn build_router(state: AppState, max_body: usize) -> Router {
         .route("/v1/l/batch", post(post_batch))
         .route("/v1/metrics/batch", post(post_metrics_batch))
         .route("/api/public/projects", get(get_projects))
-        .route("/api/public/otel/v1/traces", post(otlp::post_otel_traces));
+        .route("/api/public/otel/v1/traces", post(otlp::post_otel_traces))
+        .route("/api/public/media", post(media::post_media))
+        .route(
+            "/api/public/media/:mediaId",
+            get(media::get_media).patch(media::patch_media),
+        )
+        .route(
+            "/api/public/media/:mediaId/upload",
+            put(media::put_media_upload),
+        );
 
     let protected_routes = Router::new()
         .merge(query_routes)
         .merge(write_routes)
         .route_layer(middleware::from_fn_with_state(state.clone(), auth));
 
+    let media_content_routes = Router::new()
+        .route(
+            "/api/public/media/:mediaId/content",
+            get(media::get_media_content),
+        )
+        .with_state(state.clone());
+
     Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/api/internal/rate_limit_stats", get(get_rate_limit_stats))
         .route("/api/internal/ingest_stats", get(get_ingest_stats))
+        .merge(media_content_routes)
         .merge(protected_routes)
         .layer(DefaultBodyLimit::max(max_body))
         .with_state(state)
@@ -86,6 +104,8 @@ pub async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
     let rate_limit_stats = Arc::new(RateLimitStats::new());
     let ingest_stats = Arc::new(IngestStats::new());
 
+    std::fs::create_dir_all(&config.media_dir)?;
+
     let state = AppState {
         db: db_conn,
         api_bearer_token: Arc::from(config.api_bearer_token),
@@ -100,6 +120,9 @@ pub async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
         rate_limit_qps: qps,
         rate_limit_burst: burst,
         allow_unauthenticated_compat: config.allow_unauthenticated_compat,
+        media_dir: Arc::from(config.media_dir),
+        public_base_url: config.public_base_url.map(Arc::from),
+        media_max_content_length: config.media_max_content_length,
     };
 
     tokio::spawn(ingest_worker(
