@@ -1,7 +1,7 @@
 # ==========================================
 # Stage 1: Build aarch64-unknown-linux-musl binary
 # ==========================================
-FROM rust:1.80-slim as builder
+FROM rust:1.85-slim AS builder
 
 # Install essential build dependencies and cross-compilation toolchain for aarch64 musl
 RUN apt-get update && apt-get install -y \
