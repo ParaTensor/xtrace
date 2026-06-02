@@ -346,16 +346,26 @@ fn map_otel_to_batches(
                     });
 
                 let trace_name = extract_string_attr(&span.attributes, "langfuse.trace.name");
-                let user_id = extract_string_attr(&span.attributes, "user.id");
+                let user_id = extract_string_attr(&span.attributes, "user.id")
+                    .or_else(|| extract_string_attr(&span.attributes, "langfuse.user.id"))
+                    .or_else(|| extract_string_attr(&span.attributes, "enduser.id"));
                 let session_id = extract_string_attr(&span.attributes, "session.id");
                 let tags = extract_array_string_attr(&span.attributes, "langfuse.trace.tags");
                 let trace_meta = extract_prefixed_map(&span.attributes, "langfuse.trace.metadata.");
+
+                let span_trace_name = trace_name.clone().or_else(|| {
+                    if parent_uuid.is_none() {
+                        Some(span.name.clone())
+                    } else {
+                        None
+                    }
+                });
 
                 trace_acc
                     .entry(trace_id)
                     .and_modify(|t| {
                         if t.name.is_none() {
-                            t.name = trace_name.clone();
+                            t.name = span_trace_name.clone();
                         }
                         if t.userId.is_none() {
                             t.userId = user_id.clone();
@@ -381,7 +391,7 @@ fn map_otel_to_batches(
                     .or_insert_with(|| TraceIngest {
                         id: trace_id,
                         timestamp: None,
-                        name: trace_name.clone(),
+                        name: span_trace_name.clone(),
                         input: None,
                         output: None,
                         session_id: session_id.clone(),
@@ -414,11 +424,35 @@ fn map_otel_to_batches(
                 let (completion_tokens, prompt_tokens, total_tokens, usage_json) =
                     parse_usage_details(&span.attributes);
 
+                let obs_latency = match (start_time, end_time) {
+                    (Some(st), Some(et)) => {
+                        let secs = (et - st).num_milliseconds() as f64 / 1000.0;
+                        if secs.is_finite() && secs >= 0.0 {
+                            Some(secs)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+
+                let level = extract_string_attr(&span.attributes, "langfuse.observation.level")
+                    .map(|s| s.to_uppercase())
+                    .or_else(|| {
+                        extract_string_attr(&span.attributes, "otel.status_code").and_then(|s| {
+                            if s == "ERROR" || s == "2" {
+                                Some("ERROR".to_string())
+                            } else {
+                                None
+                            }
+                        })
+                    });
+
                 let obs = ObservationIngest {
                     id: span_uuid,
                     traceId: trace_id,
                     r#type: obs_type,
-                    name: Some(span.name),
+                    name: Some(span.name.clone()),
                     startTime: start_time,
                     endTime: end_time,
                     completionStartTime: None,
@@ -427,8 +461,11 @@ fn map_otel_to_batches(
                     input,
                     output,
                     usage: usage_json,
-                    level: None,
-                    statusMessage: None,
+                    level,
+                    statusMessage: extract_string_attr(
+                        &span.attributes,
+                        "langfuse.observation.status_message",
+                    ),
                     parentObservationId: parent_uuid,
                     promptId: None,
                     promptName: None,
@@ -440,7 +477,7 @@ fn map_otel_to_batches(
                     calculatedInputCost: None,
                     calculatedOutputCost: None,
                     calculatedTotalCost: None,
-                    latency: None,
+                    latency: obs_latency,
                     timeToFirstToken: None,
                     completionTokens: completion_tokens,
                     promptTokens: prompt_tokens,

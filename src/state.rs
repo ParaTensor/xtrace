@@ -152,7 +152,7 @@ pub struct AppState {
     pub media_max_content_length: usize,
 }
 
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 pub struct MediaRow {
     pub id: String,
     pub project_id: String,
@@ -311,6 +311,18 @@ impl MemoryDb {
                 }
             }
         }
+
+        let media_path = dir.join("media.json");
+        if media_path.exists() {
+            if let Ok(file) = std::fs::File::open(&media_path) {
+                if let Ok(data) = serde_json::from_reader::<_, Vec<MediaRow>>(file) {
+                    for r in data {
+                        let key = format!("{}:{}", r.project_id, r.id);
+                        self.media.insert(key, r);
+                    }
+                }
+            }
+        }
     }
 
     pub fn save(&self) {
@@ -344,6 +356,12 @@ impl MemoryDb {
             if let Ok(m) = self.metrics.lock() {
                 let _ = serde_json::to_writer_pretty(file, &*m);
             }
+        }
+
+        let media_path = dir.join("media.json");
+        if let Ok(file) = std::fs::File::create(&media_path) {
+            let data: Vec<MediaRow> = self.media.iter().map(|item| item.value().clone()).collect();
+            let _ = serde_json::to_writer_pretty(file, &data);
         }
     }
 

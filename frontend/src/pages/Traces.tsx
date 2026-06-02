@@ -5,8 +5,8 @@ import { TraceDetail } from "@/components/traces/TraceDetail";
 import { useQuery } from "@tanstack/react-query";
 import { fetchTrace, fetchTraces, type TraceDetail as TraceDetailType } from "@/lib/xtrace";
 
-const formatSeconds = (value: number | null) => {
-  if (value === null || Number.isNaN(value)) return "-";
+const formatSeconds = (value: number | null | undefined) => {
+  if (value == null || !Number.isFinite(value) || value < 0) return "-";
   return `${value.toFixed(2)}s`;
 };
 

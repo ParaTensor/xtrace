@@ -220,7 +220,10 @@ async fn metrics_overview_returns_count_and_latency() {
         "metrics": [{"measure": "count", "aggregation": "count"}]
     });
 
-    let uri = format!("/api/public/metrics?query={}", url_encode_json(&query_param));
+    let uri = format!(
+        "/api/public/metrics?query={}",
+        url_encode_json(&query_param)
+    );
     let response = app
         .clone()
         .oneshot(authed_request("GET", &uri, &token, None))
@@ -235,7 +238,10 @@ async fn metrics_overview_returns_count_and_latency() {
         "toTimestamp": "3000-01-01T00:00:00Z",
         "filters": [{"column": "level", "value": "ERROR"}]
     });
-    let error_uri = format!("/api/public/metrics?query={}", url_encode_json(&error_query));
+    let error_uri = format!(
+        "/api/public/metrics?query={}",
+        url_encode_json(&error_query)
+    );
     let error_response = app
         .oneshot(authed_request("GET", &error_uri, &token, None))
         .await
@@ -301,10 +307,15 @@ async fn in_memory_storage_integration_test() {
         .await
         .unwrap();
     assert_eq!(list_response.status(), StatusCode::OK);
-    let body_bytes = axum::body::to_bytes(list_response.into_body(), usize::MAX).await.unwrap();
+    let body_bytes = axum::body::to_bytes(list_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let list_data: Value = serde_json::from_slice(&body_bytes).unwrap();
     assert_eq!(list_data["data"].as_array().unwrap().len(), 1);
-    assert_eq!(list_data["data"][0]["name"].as_str(), Some("in-memory-test"));
+    assert_eq!(
+        list_data["data"][0]["name"].as_str(),
+        Some("in-memory-test")
+    );
 
     // 3. Fetch trace detail
     let detail_response = app
@@ -318,11 +329,16 @@ async fn in_memory_storage_integration_test() {
         .await
         .unwrap();
     assert_eq!(detail_response.status(), StatusCode::OK);
-    let detail_bytes = axum::body::to_bytes(detail_response.into_body(), usize::MAX).await.unwrap();
+    let detail_bytes = axum::body::to_bytes(detail_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let detail_data: Value = serde_json::from_slice(&detail_bytes).unwrap();
     assert_eq!(detail_data["name"].as_str(), Some("in-memory-test"));
     assert_eq!(detail_data["observations"].as_array().unwrap().len(), 1);
-    assert_eq!(detail_data["observations"][0]["name"].as_str(), Some("llm-mock"));
+    assert_eq!(
+        detail_data["observations"][0]["name"].as_str(),
+        Some("llm-mock")
+    );
 
     // 4. Ingest a metric point
     let write_response = app
@@ -358,9 +374,15 @@ async fn in_memory_storage_integration_test() {
         .await
         .unwrap();
     assert_eq!(names_response.status(), StatusCode::OK);
-    let names_bytes = axum::body::to_bytes(names_response.into_body(), usize::MAX).await.unwrap();
+    let names_bytes = axum::body::to_bytes(names_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let names_data: Value = serde_json::from_slice(&names_bytes).unwrap();
-    assert!(names_data["data"].as_array().unwrap().iter().any(|v| v.as_str() == Some("cpu_load")));
+    assert!(names_data["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v.as_str() == Some("cpu_load")));
 
     // 6. Query metrics values
     let query_response = app
@@ -374,11 +396,16 @@ async fn in_memory_storage_integration_test() {
         .await
         .unwrap();
     assert_eq!(query_response.status(), StatusCode::OK);
-    let query_bytes = axum::body::to_bytes(query_response.into_body(), usize::MAX).await.unwrap();
+    let query_bytes = axum::body::to_bytes(query_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let query_data: Value = serde_json::from_slice(&query_bytes).unwrap();
     assert_eq!(query_data["data"].as_array().unwrap().len(), 1);
     assert_eq!(query_data["data"][0]["values"].as_array().unwrap().len(), 1);
-    assert_eq!(query_data["data"][0]["values"][0]["value"].as_f64(), Some(75.0));
+    assert_eq!(
+        query_data["data"][0]["values"][0]["value"].as_f64(),
+        Some(75.0)
+    );
 
     // 7. Query daily metrics
     let daily_response = app
@@ -392,7 +419,9 @@ async fn in_memory_storage_integration_test() {
         .await
         .unwrap();
     assert_eq!(daily_response.status(), StatusCode::OK);
-    let daily_bytes = axum::body::to_bytes(daily_response.into_body(), usize::MAX).await.unwrap();
+    let daily_bytes = axum::body::to_bytes(daily_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let daily_data: Value = serde_json::from_slice(&daily_bytes).unwrap();
     assert_eq!(daily_data["data"].as_array().unwrap().len(), 1);
     assert_eq!(daily_data["data"][0]["countTraces"].as_i64(), Some(1));
@@ -404,14 +433,19 @@ async fn in_memory_storage_integration_test() {
         "toTimestamp": "3000-01-01T00:00:00Z",
         "metrics": [{"measure": "count", "aggregation": "count"}]
     });
-    let uri = format!("/api/public/metrics?query={}", url_encode_json(&query_param));
+    let uri = format!(
+        "/api/public/metrics?query={}",
+        url_encode_json(&query_param)
+    );
     let response = app
         .clone()
         .oneshot(authed_request("GET", &uri, &token, None))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let overview_bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let overview_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let overview_data: Value = serde_json::from_slice(&overview_bytes).unwrap();
     assert_eq!(overview_data["data"][0]["count_count"].as_i64(), Some(1));
 
@@ -421,13 +455,21 @@ async fn in_memory_storage_integration_test() {
         "toTimestamp": "3000-01-01T00:00:00Z",
         "filters": [{"column": "level", "value": "ERROR"}]
     });
-    let error_uri = format!("/api/public/metrics?query={}", url_encode_json(&error_query));
+    let error_uri = format!(
+        "/api/public/metrics?query={}",
+        url_encode_json(&error_query)
+    );
     let error_response = app
         .oneshot(authed_request("GET", &error_uri, &token, None))
         .await
         .unwrap();
     assert_eq!(error_response.status(), StatusCode::OK);
-    let error_bytes = axum::body::to_bytes(error_response.into_body(), usize::MAX).await.unwrap();
+    let error_bytes = axum::body::to_bytes(error_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let error_data: Value = serde_json::from_slice(&error_bytes).unwrap();
-    assert_eq!(error_data["data"][0]["traceId"].as_str(), Some(trace_id.to_string().as_str()));
+    assert_eq!(
+        error_data["data"][0]["traceId"].as_str(),
+        Some(trace_id.to_string().as_str())
+    );
 }

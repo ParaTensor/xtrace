@@ -269,7 +269,8 @@ pub(crate) async fn ingest_worker(
 
         let res = match &db {
             crate::state::DatabaseConnection::Postgres(pool) => {
-                write_batches(pool, default_project_id.as_ref(), batches).await
+                write_batches(pool, default_project_id.as_ref(), batches)
+                    .await
                     .map_err(|e| anyhow::anyhow!(e))
             }
             crate::state::DatabaseConnection::Memory(mem_db) => {
@@ -360,13 +361,68 @@ fn resolve_observation(obs: ObservationIngest, default_project_id: &str) -> Reso
     }
 }
 
+fn duration_secs(start: DateTime<Utc>, end: DateTime<Utc>) -> Option<f64> {
+    let secs = (end - start).num_milliseconds() as f64 / 1000.0;
+    if secs.is_finite() && secs >= 0.0 {
+        Some(secs)
+    } else {
+        None
+    }
+}
+
+/// Fill missing trace/observation scalars from span timing and root span names.
+pub(crate) fn enrich_batch(batch: &mut BatchIngestRequest) {
+    for obs in &mut batch.observations {
+        if obs.latency.is_none() {
+            if let (Some(start), Some(end)) = (obs.startTime, obs.endTime) {
+                obs.latency = duration_secs(start, end);
+            }
+        }
+    }
+
+    let mut min_start: Option<DateTime<Utc>> = None;
+    let mut max_end: Option<DateTime<Utc>> = None;
+    let mut root_name: Option<String> = None;
+
+    for obs in &batch.observations {
+        if let Some(start) = obs.startTime {
+            min_start = Some(min_start.map_or(start, |cur| cur.min(start)));
+        }
+        if let Some(end) = obs.endTime {
+            max_end = Some(max_end.map_or(end, |cur| cur.max(end)));
+        }
+        if obs.parentObservationId.is_none() {
+            if root_name.is_none() {
+                root_name = obs.name.clone();
+            }
+        }
+    }
+
+    let Some(trace) = batch.trace.as_mut() else {
+        return;
+    };
+
+    if trace.name.is_none() {
+        trace.name = root_name.or_else(|| batch.observations.first().and_then(|o| o.name.clone()));
+    }
+    if trace.latency.is_none() {
+        if let (Some(start), Some(end)) = (min_start, max_end) {
+            trace.latency = duration_secs(start, end);
+        }
+    }
+}
+
 async fn write_batches(
     pool: &PgPool,
     default_project_id: &str,
-    payloads: Vec<BatchIngestRequest>,
+    mut payloads: Vec<BatchIngestRequest>,
 ) -> Result<(), sqlx::Error> {
     if payloads.is_empty() {
         return Ok(());
+    }
+
+    for payload in &mut payloads {
+        enrich_batch(payload);
     }
 
     let now = Utc::now();
@@ -565,8 +621,12 @@ async fn write_batches(
 fn write_batches_to_memory(
     mem_db: &crate::state::MemoryDb,
     default_project_id: &str,
-    payloads: Vec<BatchIngestRequest>,
+    mut payloads: Vec<BatchIngestRequest>,
 ) -> Result<(), anyhow::Error> {
+    for payload in &mut payloads {
+        enrich_batch(payload);
+    }
+
     let now = Utc::now();
     let mut resolved_traces = Vec::new();
     let mut resolved_obs = Vec::new();

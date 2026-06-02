@@ -149,7 +149,7 @@ export BASE_URL=http://127.0.0.1:8742
 curl -sS "$BASE_URL/api/public/traces?page=1&limit=2" \
   -H "Authorization: Bearer $API_BEARER_TOKEN"
 
-# 2) traces list (fields=core: omits input/output/metadata; latency/totalCost = -1; scores/observations empty)
+# 2) traces list (fields=core: omits input/output/metadata; includes latency/totalCost; scores/observations empty)
 curl -sS "$BASE_URL/api/public/traces?page=1&limit=2&fields=core" \
   -H "Authorization: Bearer $API_BEARER_TOKEN"
 

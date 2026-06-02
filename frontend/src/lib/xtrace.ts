@@ -92,9 +92,12 @@ const buildHeaders = () => {
 
 export async function fetchTraces() {
   const baseUrl = getBaseUrl();
-  const response = await fetch(`${baseUrl}/api/public/traces?page=1&limit=50`, {
-    headers: buildHeaders(),
-  });
+  const response = await fetch(
+    `${baseUrl}/api/public/traces?page=1&limit=50&fields=core`,
+    {
+      headers: buildHeaders(),
+    }
+  );
   if (!response.ok) {
     throw new Error(`Failed to load traces (${response.status})`);
   }
@@ -103,9 +106,12 @@ export async function fetchTraces() {
 
 export async function fetchTrace(traceId: string) {
   const baseUrl = getBaseUrl();
-  const response = await fetch(`${baseUrl}/api/public/traces/${traceId}`, {
-    headers: buildHeaders(),
-  });
+  const response = await fetch(
+    `${baseUrl}/api/public/traces/${traceId}?resolveMedia=true&resolveWith=base64DataUri`,
+    {
+      headers: buildHeaders(),
+    },
+  );
   if (!response.ok) {
     throw new Error(`Failed to load trace (${response.status})`);
   }

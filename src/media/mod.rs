@@ -48,24 +48,36 @@ pub fn url_expiry_rfc3339(hours: i64) -> String {
     (Utc::now() + Duration::hours(hours)).to_rfc3339()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaResolveWith {
+    Base64DataUri,
+    ContentUrl,
+}
+
 #[derive(Debug, Clone)]
 struct ParsedMediaReference {
     media_id: String,
+    content_type: Option<String>,
 }
 
 fn parse_media_reference(reference: &str) -> Option<ParsedMediaReference> {
-    let s = reference
-        .strip_prefix("@@@langfuseMedia:")?
-        .strip_suffix("@@@")?;
+    let s = reference.strip_prefix("@@@langfuseMedia:")?;
+    let s = s.strip_suffix("@@@").unwrap_or(s);
     let mut media_id = None;
+    let mut content_type = None;
     for part in s.split('|') {
-        let (k, v) = part.split_once('=')?;
-        if k == "id" {
-            media_id = Some(v.to_string());
+        let Some((k, v)) = part.split_once('=') else {
+            continue;
+        };
+        match k {
+            "id" => media_id = Some(v.to_string()),
+            "type" => content_type = Some(v.to_string()),
+            _ => {}
         }
     }
     Some(ParsedMediaReference {
         media_id: media_id?,
+        content_type,
     })
 }
 
@@ -81,22 +93,27 @@ fn find_media_references(s: &str) -> Vec<&str> {
             refs.push(&s[abs..end]);
             pos = end;
         } else {
+            refs.push(&s[abs..]);
             break;
         }
     }
     refs
 }
 
-/// Replace `@@@langfuseMedia:...@@@` tokens in JSON with base64 data URIs when bytes are available.
+/// Replace `@@@langfuseMedia:...@@@` tokens in JSON with base64 data URIs or content URLs.
 #[allow(clippy::type_complexity)]
 pub fn resolve_media_references_in_json(
     value: &JsonValue,
     load_bytes: &dyn Fn(&str) -> Option<(String, Vec<u8>)>,
+    resolve_with: MediaResolveWith,
+    media_content_url: Option<&dyn Fn(&str) -> String>,
     max_depth: usize,
 ) -> JsonValue {
     fn walk(
         value: &JsonValue,
         load_bytes: &dyn Fn(&str) -> Option<(String, Vec<u8>)>,
+        resolve_with: MediaResolveWith,
+        media_content_url: Option<&dyn Fn(&str) -> String>,
         depth: usize,
         max_depth: usize,
     ) -> JsonValue {
@@ -105,40 +122,98 @@ pub fn resolve_media_references_in_json(
         }
         match value {
             JsonValue::String(s) => {
-                JsonValue::String(resolve_media_references_in_str(s, load_bytes))
+                if let Ok(parsed) = serde_json::from_str::<JsonValue>(s) {
+                    if parsed.is_object() || parsed.is_array() {
+                        let resolved = walk(
+                            &parsed,
+                            load_bytes,
+                            resolve_with,
+                            media_content_url,
+                            depth + 1,
+                            max_depth,
+                        );
+                        return JsonValue::String(resolved.to_string());
+                    }
+                }
+                JsonValue::String(resolve_media_references_in_str(
+                    s,
+                    load_bytes,
+                    resolve_with,
+                    media_content_url,
+                ))
             }
             JsonValue::Array(arr) => JsonValue::Array(
                 arr.iter()
-                    .map(|v| walk(v, load_bytes, depth + 1, max_depth))
+                    .map(|v| {
+                        walk(
+                            v,
+                            load_bytes,
+                            resolve_with,
+                            media_content_url,
+                            depth + 1,
+                            max_depth,
+                        )
+                    })
                     .collect(),
             ),
             JsonValue::Object(map) => JsonValue::Object(
                 map.iter()
-                    .map(|(k, v)| (k.clone(), walk(v, load_bytes, depth + 1, max_depth)))
+                    .map(|(k, v)| {
+                        (
+                            k.clone(),
+                            walk(
+                                v,
+                                load_bytes,
+                                resolve_with,
+                                media_content_url,
+                                depth + 1,
+                                max_depth,
+                            ),
+                        )
+                    })
                     .collect(),
             ),
             _ => value.clone(),
         }
     }
-    walk(value, load_bytes, 0, max_depth)
+    walk(
+        value,
+        load_bytes,
+        resolve_with,
+        media_content_url,
+        0,
+        max_depth,
+    )
 }
 
 #[allow(clippy::type_complexity)]
 pub fn resolve_media_references_in_str(
     s: &str,
     load_bytes: &dyn Fn(&str) -> Option<(String, Vec<u8>)>,
+    resolve_with: MediaResolveWith,
+    media_content_url: Option<&dyn Fn(&str) -> String>,
 ) -> String {
     let mut out = s.to_string();
     for reference in find_media_references(s) {
         let Some(parsed) = parse_media_reference(reference) else {
             continue;
         };
-        let Some((content_type, bytes)) = load_bytes(&parsed.media_id) else {
+        let replacement = if let Some((mut content_type, bytes)) = load_bytes(&parsed.media_id) {
+            if let Some(t) = &parsed.content_type {
+                content_type = t.clone();
+            }
+            let b64 = BASE64_STANDARD.encode(&bytes);
+            format!("data:{content_type};base64,{b64}")
+        } else if resolve_with == MediaResolveWith::ContentUrl {
+            if let Some(url_for) = media_content_url {
+                url_for(&parsed.media_id)
+            } else {
+                continue;
+            }
+        } else {
             continue;
         };
-        let b64 = BASE64_STANDARD.encode(&bytes);
-        let data_uri = format!("data:{content_type};base64,{b64}");
-        out = out.replace(reference, &data_uri);
+        out = out.replace(reference, &replacement);
     }
     out
 }
@@ -175,9 +250,27 @@ mod tests {
                     None
                 }
             },
-            10,
+            MediaResolveWith::Base64DataUri,
+            None,
+            32,
         );
         let url = resolved["content"][0]["image_url"]["url"].as_str().unwrap();
         assert!(url.starts_with("data:image/jpeg;base64,"));
+    }
+
+    #[test]
+    fn resolves_unclosed_media_reference_to_content_url() {
+        let reference =
+            "@@@langfuseMedia:type=image/png|id=test-id-123456789012|source=base64_data_uri";
+        let resolved = resolve_media_references_in_str(
+            reference,
+            &|_| None,
+            MediaResolveWith::ContentUrl,
+            Some(&|id| format!("http://example.test/api/public/media/{id}/content")),
+        );
+        assert_eq!(
+            resolved,
+            "http://example.test/api/public/media/test-id-123456789012/content"
+        );
     }
 }

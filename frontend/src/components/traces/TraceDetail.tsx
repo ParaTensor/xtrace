@@ -35,8 +35,8 @@ interface TraceDetailProps {
   trace: TraceDetail;
 }
 
-const formatSeconds = (value: number | null) => {
-  if (value === null || Number.isNaN(value)) return "-";
+const formatSeconds = (value: number | null | undefined) => {
+  if (value == null || !Number.isFinite(value) || value < 0) return "-";
   return `${value.toFixed(2)}s`;
 };
 

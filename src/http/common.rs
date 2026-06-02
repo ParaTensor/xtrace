@@ -53,12 +53,10 @@ pub async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
                 }
             }
         }
-        crate::state::DatabaseConnection::Memory(_) => {
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({ "status": "ready" })),
-            )
-                .into_response()
-        }
+        crate::state::DatabaseConnection::Memory(_) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "status": "ready" })),
+        )
+            .into_response(),
     }
 }

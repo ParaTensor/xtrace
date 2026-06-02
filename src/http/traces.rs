@@ -155,12 +155,36 @@ fn parse_trace_fields(fields: Option<&str>) -> TraceFieldsMask {
         .filter(|s| !s.is_empty())
         .collect();
 
+    // Langfuse-style `fields=core`: lightweight list rows with scalar metrics only.
+    if set.contains("core") {
+        return TraceFieldsMask {
+            io: false,
+            scores: false,
+            observations: false,
+            metrics: true,
+        };
+    }
+
     TraceFieldsMask {
         io: set.contains("io"),
         scores: set.contains("scores"),
         observations: set.contains("observations"),
         metrics: set.contains("metrics"),
     }
+}
+
+fn trace_list_latency(latency: Option<f64>, metrics_included: bool) -> Option<f64> {
+    if !metrics_included {
+        return None;
+    }
+    latency.filter(|v| v.is_finite() && *v >= 0.0)
+}
+
+fn trace_list_total_cost(total_cost: Option<f64>, metrics_included: bool) -> Option<f64> {
+    if !metrics_included {
+        return None;
+    }
+    total_cost.filter(|v| v.is_finite() && *v >= 0.0)
 }
 
 fn apply_trace_filters(builder: &mut QueryBuilder<'_, sqlx::Postgres>, q: &TraceListQuery) {
@@ -317,8 +341,8 @@ FROM (
                         external_id: r.external_id,
                         bookmarked: r.bookmarked,
                         environment: r.environment,
-                        latency: Some(-1.0),
-                        total_cost: Some(-1.0),
+                        latency: trace_list_latency(None, fields.metrics),
+                        total_cost: trace_list_total_cost(None, fields.metrics),
                         created_at: r.created_at,
                         updated_at: r.updated_at,
                         observations: vec![],
@@ -433,16 +457,8 @@ SELECT
                         Vec::with_capacity(0)
                     };
 
-                    let latency = if fields.metrics {
-                        r.latency
-                    } else {
-                        Some(-1.0)
-                    };
-                    let total_cost = if fields.metrics {
-                        r.total_cost
-                    } else {
-                        Some(-1.0)
-                    };
+                    let latency = trace_list_latency(r.latency, fields.metrics);
+                    let total_cost = trace_list_total_cost(r.total_cost, fields.metrics);
 
                     TraceListItem {
                         html_path: format!("/project/{}/traces/{}", r.project_id, r.id),
@@ -655,16 +671,8 @@ SELECT
                         external_id: r.external_id,
                         bookmarked: r.bookmarked,
                         environment: r.environment,
-                        latency: if fields.metrics {
-                            r.latency
-                        } else {
-                            Some(-1.0)
-                        },
-                        total_cost: if fields.metrics {
-                            r.total_cost
-                        } else {
-                            Some(-1.0)
-                        },
+                        latency: trace_list_latency(r.latency, fields.metrics),
+                        total_cost: trace_list_total_cost(r.total_cost, fields.metrics),
                         created_at: r.created_at,
                         updated_at: r.updated_at,
                         observations,
@@ -858,11 +866,51 @@ struct ScoreV1Dto {
     string_value: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+enum TraceMediaResolveWith {
+    #[default]
+    #[serde(rename = "base64DataUri", alias = "base64_data_uri")]
+    Base64DataUri,
+    #[serde(rename = "contentUrl", alias = "content_url")]
+    ContentUrl,
+}
+
+fn default_resolve_media() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GetTraceQuery {
-    #[serde(default)]
+    #[serde(default = "default_resolve_media")]
     resolve_media: bool,
+    #[serde(default)]
+    resolve_with: TraceMediaResolveWith,
+}
+
+fn media_public_base(state: &AppState, headers: &axum::http::HeaderMap) -> String {
+    if let Some(base) = state.public_base_url.as_deref() {
+        return base.trim_end_matches('/').to_string();
+    }
+    if let Some(proto) = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+    {
+        if let Some(host) = headers
+            .get(axum::http::header::HOST)
+            .and_then(|v| v.to_str().ok())
+        {
+            return format!("{proto}://{host}");
+        }
+    }
+    if let Some(host) = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+    {
+        return format!("http://{host}");
+    }
+    "http://127.0.0.1:8742".to_string()
 }
 
 async fn resolve_json_value(
@@ -870,32 +918,55 @@ async fn resolve_json_value(
     project_id: &str,
     value: JsonValue,
     enabled: bool,
+    resolve_with: TraceMediaResolveWith,
+    public_base: &str,
 ) -> JsonValue {
     if !enabled {
         return value;
     }
     let state = state.clone();
     let project_id = project_id.to_string();
-    crate::media::resolve_media_references_in_json(
-        &value,
-        &|media_id| {
+    let public_base = public_base.to_string();
+    let load_bytes =
+        |media_id: &str| {
             tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(
                     crate::http::media::load_media_bytes_async(&state, &project_id, media_id),
                 )
             })
-        },
-        10,
-    )
+        };
+    match resolve_with {
+        TraceMediaResolveWith::ContentUrl => {
+            let url_for =
+                |media_id: &str| format!("{public_base}/api/public/media/{media_id}/content");
+            crate::media::resolve_media_references_in_json(
+                &value,
+                &load_bytes,
+                crate::media::MediaResolveWith::ContentUrl,
+                Some(&url_for),
+                32,
+            )
+        }
+        TraceMediaResolveWith::Base64DataUri => crate::media::resolve_media_references_in_json(
+            &value,
+            &load_bytes,
+            crate::media::MediaResolveWith::Base64DataUri,
+            None,
+            32,
+        ),
+    }
 }
 
 pub(crate) async fn get_trace(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path(trace_id): Path<Uuid>,
     Query(query): Query<GetTraceQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     let project_id = state.default_project_id.as_ref();
     let resolve_media = query.resolve_media;
+    let resolve_with = query.resolve_with;
+    let public_base = media_public_base(&state, &headers);
 
     match &state.db {
         crate::state::DatabaseConnection::Postgres(pool) => {
@@ -1081,16 +1152,61 @@ ORDER BY start_time NULLS LAST, created_at
                 observations: obs_dtos,
             };
             if resolve_media {
-                dto.input = resolve_json_value(&state, project_id, dto.input, true).await;
-                dto.output = resolve_json_value(&state, project_id, dto.output, true).await;
-                dto.metadata = resolve_json_value(&state, project_id, dto.metadata, true).await;
+                dto.input = resolve_json_value(
+                    &state,
+                    project_id,
+                    dto.input,
+                    true,
+                    resolve_with,
+                    &public_base,
+                )
+                .await;
+                dto.output = resolve_json_value(
+                    &state,
+                    project_id,
+                    dto.output,
+                    true,
+                    resolve_with,
+                    &public_base,
+                )
+                .await;
+                dto.metadata = resolve_json_value(
+                    &state,
+                    project_id,
+                    dto.metadata,
+                    true,
+                    resolve_with,
+                    &public_base,
+                )
+                .await;
                 for obs in &mut dto.observations {
-                    obs.input =
-                        resolve_json_value(&state, project_id, obs.input.clone(), true).await;
-                    obs.output =
-                        resolve_json_value(&state, project_id, obs.output.clone(), true).await;
-                    obs.metadata =
-                        resolve_json_value(&state, project_id, obs.metadata.clone(), true).await;
+                    obs.input = resolve_json_value(
+                        &state,
+                        project_id,
+                        obs.input.clone(),
+                        true,
+                        resolve_with,
+                        &public_base,
+                    )
+                    .await;
+                    obs.output = resolve_json_value(
+                        &state,
+                        project_id,
+                        obs.output.clone(),
+                        true,
+                        resolve_with,
+                        &public_base,
+                    )
+                    .await;
+                    obs.metadata = resolve_json_value(
+                        &state,
+                        project_id,
+                        obs.metadata.clone(),
+                        true,
+                        resolve_with,
+                        &public_base,
+                    )
+                    .await;
                 }
             }
 
@@ -1219,16 +1335,61 @@ ORDER BY start_time NULLS LAST, created_at
                 observations: obs_dtos,
             };
             if resolve_media {
-                dto.input = resolve_json_value(&state, project_id, dto.input, true).await;
-                dto.output = resolve_json_value(&state, project_id, dto.output, true).await;
-                dto.metadata = resolve_json_value(&state, project_id, dto.metadata, true).await;
+                dto.input = resolve_json_value(
+                    &state,
+                    project_id,
+                    dto.input,
+                    true,
+                    resolve_with,
+                    &public_base,
+                )
+                .await;
+                dto.output = resolve_json_value(
+                    &state,
+                    project_id,
+                    dto.output,
+                    true,
+                    resolve_with,
+                    &public_base,
+                )
+                .await;
+                dto.metadata = resolve_json_value(
+                    &state,
+                    project_id,
+                    dto.metadata,
+                    true,
+                    resolve_with,
+                    &public_base,
+                )
+                .await;
                 for obs in &mut dto.observations {
-                    obs.input =
-                        resolve_json_value(&state, project_id, obs.input.clone(), true).await;
-                    obs.output =
-                        resolve_json_value(&state, project_id, obs.output.clone(), true).await;
-                    obs.metadata =
-                        resolve_json_value(&state, project_id, obs.metadata.clone(), true).await;
+                    obs.input = resolve_json_value(
+                        &state,
+                        project_id,
+                        obs.input.clone(),
+                        true,
+                        resolve_with,
+                        &public_base,
+                    )
+                    .await;
+                    obs.output = resolve_json_value(
+                        &state,
+                        project_id,
+                        obs.output.clone(),
+                        true,
+                        resolve_with,
+                        &public_base,
+                    )
+                    .await;
+                    obs.metadata = resolve_json_value(
+                        &state,
+                        project_id,
+                        obs.metadata.clone(),
+                        true,
+                        resolve_with,
+                        &public_base,
+                    )
+                    .await;
                 }
             }
 
@@ -1256,7 +1417,15 @@ mod tests {
         assert!(!mask.io);
         assert!(!mask.scores);
         assert!(!mask.observations);
-        assert!(!mask.metrics);
+        assert!(mask.metrics);
+    }
+
+    #[test]
+    fn trace_list_latency_filters_sentinel_and_invalid() {
+        assert_eq!(trace_list_latency(Some(-1.0), true), None);
+        assert_eq!(trace_list_latency(Some(f64::NAN), true), None);
+        assert_eq!(trace_list_latency(Some(1.5), true), Some(1.5));
+        assert_eq!(trace_list_latency(Some(1.5), false), None);
     }
 
     #[test]

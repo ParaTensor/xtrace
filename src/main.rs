@@ -73,7 +73,16 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or(20 * 1024 * 1024),
         media_dir: std::env::var("XTRACE_MEDIA_DIR")
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| std::path::PathBuf::from(".xtrace_media")),
+            .unwrap_or_else(|_| {
+                if is_mock {
+                    let base = json_dir_env
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(|| std::path::PathBuf::from("./.xtrace_data"));
+                    base.join("media")
+                } else {
+                    std::path::PathBuf::from(".xtrace_media")
+                }
+            }),
         public_base_url: std::env::var("XTRACE_PUBLIC_BASE_URL").ok(),
         media_max_content_length: std::env::var("XTRACE_MEDIA_MAX_CONTENT_LENGTH")
             .ok()

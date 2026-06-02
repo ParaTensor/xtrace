@@ -334,7 +334,6 @@ pub(crate) async fn load_media_bytes_async(
     media_id: &str,
 ) -> Option<(String, Vec<u8>)> {
     let row = get_media_row(state, project_id, media_id).await.ok()??;
-    row.uploaded_at?;
     let path = media_file_path(
         state.media_dir.as_ref(),
         project_id,
@@ -342,5 +341,8 @@ pub(crate) async fn load_media_bytes_async(
         &row.content_type,
     );
     let bytes = std::fs::read(&path).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
     Some((row.content_type, bytes))
 }
