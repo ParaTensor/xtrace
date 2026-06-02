@@ -2,6 +2,10 @@
 
 本仓库是 **xtrace**：自托管的 AI/LLM 可观测后端（Rust + PostgreSQL），带 React 仪表板（`frontend/`）与 VitePress 文档站（`www/`）。权威运行说明见根目录 `README.md`，后端实现约定见 `docs/dev.md`，公共 HTTP 契约见 `docs/api.md`。
 
+## 脚本目录
+
+运维、打包、联调与发布相关的可执行脚本统一放在 **`scripts/`** 下（例如 `scripts/build_aarch64.sh`、`scripts/deploy.sh`），不要在仓库根目录新增 `.sh` 脚本。新增脚本时保持 `set -euo pipefail`，并从脚本路径解析仓库根目录后再 `cd` 到根目录执行构建或打包。
+
 ## 产品边界与集成原则
 
 xtrace 的定位是 **通用的 AI/LLM observability substrate**：负责接收、存储、查询与展示 traces、observations、metrics，以及少量通用关联元数据。它可以提供统一的 OTLP / HTTP ingest、公共查询接口、基础时序聚合、跨服务 trace 关联能力，但**不是**上层业务系统自身的调度面、路由面、执行面或诊断控制面。
