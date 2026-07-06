@@ -1,5 +1,7 @@
 # xtrace 指标能力与 OTLP metrics 实施路线（X0–X3）
 
+> **进度（截至 2026-07-06）**：**X0 已完成**（`POST /api/public/otel/v1/metrics`，PR #2 已合并）、**X1 已完成**（`count` 聚合 + 多 key `group_by` + `docs/api.md` 语义文档化，PR #3 已合并）。**X2 / X3 待做**。
+
 > 背景：作为让上层 LLM 服务（如 Xinference/PowerLLM）**去 Langfuse 化**、由 xtrace 承接 trace + generation + 用量/成本 + LLM 业务指标的一部分，本文规划 xtrace 侧需要补齐/增强的能力。
 > 性质：**实施规划文档，本身不含代码改动。** 具体落地须按 `AGENTS.md`：改路由先读 `src/app.rs` 装配与 `src/http/`、`src/ingest/` 现有模式；DB 变更新增顺序 `migrations/` 并验证 `sqlx migrate`；合并前跑 `cargo fmt --all --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --all`。
 > **边界原则**（`AGENTS.md`）：xtrace 是**通用 observability substrate**。以下能力均保持通用——领域语义（模型/引擎/GPU 等）**通过命名约定与 labels 承载**，不在核心 schema 固化业务专属字段或专属表。
@@ -10,13 +12,15 @@
 
 - **指标存储**：单一通用点表 `metrics(id, project_id, environment, name, labels JSONB, value, timestamp, created_at)`（`migrations/0003_add_metrics.sql`），索引 `(project_id,name,timestamp)`、labels GIN、`timestamp`。
 - **写入**：`POST /v1/metrics/batch`（`src/app.rs:38`，handler `src/http/metrics.rs`），队列 + ~50ms 微批 bulk insert。DTO `MetricPointIngest { name, labels, value, timestamp }`。
-- **查询**：`GET /api/public/metrics/query`（`name` + `from/to` + `labels` + `step`(1m/5m/1h/1d) + `agg`(avg/max/min/sum/last/**p50/p90/p99**) + `group_by`）；`GET /api/public/metrics/names`；`GET /api/public/metrics`（traces 概览:count、avg/p95/p99 latency、error count）。分位数由 `percentile_cont`(PG) / 内存实现对**原始点**计算。
-- **OTLP**：仅 traces —— `POST /api/public/otel/v1/traces`（`src/app.rs:40`，`src/ingest/otlp.rs:post_otel_traces`，支持 JSON / `application/x-protobuf` / gzip）。**无 OTLP metrics / logs**。
+- **查询**：`GET /api/public/metrics/query`（`name` + `from/to` + `labels` + `step`(1m/5m/1h/1d) + `agg`(avg/max/min/sum/last/**count**/**p50/p90/p99**) + **多 key** `group_by`(逗号分隔)）；`GET /api/public/metrics/names`；`GET /api/public/metrics`（traces 概览:count、avg/p95/p99 latency、error count）。分位数由 `percentile_cont`(PG) / 内存实现对**原始点**计算。
+- **OTLP**：traces + metrics —— `POST /api/public/otel/v1/traces` 与 `POST /api/public/otel/v1/metrics`（`src/app.rs`，`src/ingest/otlp.rs`,支持 JSON / `application/x-protobuf` / gzip）。**仍无 OTLP logs**。
 - **认证/部署**：Bearer(写) + BasicAuth(Langfuse 兼容读)；内存+JSON 零依赖模式 与 PostgreSQL 双存储；per-token 限流；`project_id` 现按单默认项目运行。
 
 ---
 
-## X0 · 新增 OTLP metrics 摄入（核心）
+## X0 · 新增 OTLP metrics 摄入（核心）— ✅ 已完成（PR #2 合并）
+
+> 落地说明：`POST /api/public/otel/v1/metrics` 已实现于 `src/ingest/otlp.rs::post_otel_metrics`,与 traces 端点对称(复用 `ungzip_if_needed` + content-type 分支 + JSON/protobuf 双路径)。Gauge/Sum 的每个 `NumberDataPoint` 落一行;Histogram 派生 `{name}_count`/`{name}_sum`(未落 `{name}_bucket`);ExponentialHistogram/Summary 记录 debug 日志并跳过。摄入复用 **`state.metrics_tx`**(既有 metrics 通道/worker,非 `ingest_tx`),无新迁移。认证与 traces 端点对称(加入 Langfuse/open-compat 允许集)。下文为原始规划,保留备查。
 
 **目标**：接收标准 OpenTelemetry metrics，使上层服务可用 OTel SDK 同时把 trace 与 metric 打进 xtrace，减少对 bespoke `/v1/metrics/batch` 与 Langfuse SDK 的耦合。
 
@@ -37,12 +41,12 @@
 
 ---
 
-## X1 · 指标查询与语义增强
+## X1 · 指标查询与语义增强 — ✅ 已完成（PR #3 合并）
 
-- **补聚合**：在 `get_metrics_query` 增加 `count`、以及由累积计数点推导的 `rate/increase`（可选，注明与 counter reset 的处理）。
-- **多维 group_by**：允许按多个 label key 分组（现为单 key）。
-- **语义文档化**：在 `docs/api.md` 明确「点即原始样本」——TTFT/时延等按**每请求一个点**上报时，`agg=p99` 为真实分位；直方图派生点仅用于兼容 OTLP Histogram 输入。
-- **概览端点澄清**：文档区分 `/api/public/metrics`（traces 概览分析）与 `/api/public/metrics/query`（通用时序），避免使用者混淆。
+- **补聚合**：✅ `get_metrics_query` 增加 `count`(每桶原始点计数,PG `COUNT(value)` / 内存 `pts.len()`)。`rate/increase` **有意暂缓**——需按序列累积计数差分 + counter reset 处理,与 xtrace「原始样本点」模型不符,已在 `docs/api.md` 注明暂不支持,避免半吊子实现。
+- **多维 group_by**：✅ `group_by` 支持逗号分隔的多 label key,按 label 值元组分组(PG 与内存两条路径),单 key 行为不变,50 series / 1000 points cap 与 `meta.truncated` 不变。
+- **语义文档化**：✅ `docs/api.md` 补齐 `/api/public/metrics/query` 与 `/api/public/metrics/names` 文档,并明确「点即原始样本、`p50/p90/p99` 为真实分位」;直方图派生点仅用于兼容 OTLP Histogram 输入。
+- **概览端点澄清**：✅ `docs/api.md` 区分 `/api/public/metrics`（traces 概览分析）与 `/api/public/metrics/query`（通用时序）。
 
 ---
 
@@ -77,7 +81,7 @@
 
 | 项 | 内容 | 边界 | 建议 |
 |----|------|------|------|
-| X0 | OTLP metrics 摄入端点 + 映射到点模型 | 通用 | **先做**（打通 OTel 底座） |
-| X1 | 查询聚合增强 + 语义文档化 | 通用 | 紧随其后 |
-| X2 | 基数治理 + 多租户 | 通用 | 视规模/商业化 |
-| X3 | 保留/降采样、token 分离、备份 | 通用 | 自托管/商业化前 |
+| X0 | OTLP metrics 摄入端点 + 映射到点模型 | 通用 | ✅ 已完成（PR #2） |
+| X1 | 查询聚合增强 + 语义文档化 | 通用 | ✅ 已完成（PR #3；`rate/increase` 暂缓） |
+| X2 | 基数治理 + 多租户 | 通用 | 待做（视规模/商业化） |
+| X3 | 保留/降采样、token 分离、备份 | 通用 | 待做（自托管/商业化前） |
