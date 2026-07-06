@@ -14,12 +14,13 @@ use crate::http::{
     auth::{auth, rate_limit},
     media,
     metrics::{self, metrics_worker, post_metrics_batch, MetricsBatchRequest},
-    ops::{get_ingest_stats, get_rate_limit_stats},
+    ops::{get_ingest_stats, get_metrics_label_governance_stats, get_rate_limit_stats},
     projects::get_projects,
     traces,
 };
 use crate::ingest::batch::{ingest_worker, post_batch, BatchIngestRequest};
 use crate::ingest::otlp;
+use crate::metrics::label_governance::LabelGovernance;
 use crate::state::{AppState, IngestStats, RateLimitStats, ServerConfig};
 
 /// Build the Axum router (used by the server and integration tests).
@@ -66,6 +67,10 @@ pub fn build_router(state: AppState, max_body: usize) -> Router {
         .route("/readyz", get(readyz))
         .route("/api/internal/rate_limit_stats", get(get_rate_limit_stats))
         .route("/api/internal/ingest_stats", get(get_ingest_stats))
+        .route(
+            "/api/internal/metrics_label_governance_stats",
+            get(get_metrics_label_governance_stats),
+        )
         .merge(media_content_routes)
         .merge(protected_routes)
         .layer(DefaultBodyLimit::max(max_body))
@@ -124,6 +129,9 @@ pub async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
         media_dir: Arc::from(config.media_dir),
         public_base_url: config.public_base_url.map(Arc::from),
         media_max_content_length: config.media_max_content_length,
+        label_governance: LabelGovernance::new(config.label_governance),
+        metrics_query_max_series: config.metrics_query_max_series,
+        metrics_query_max_points_per_series: config.metrics_query_max_points_per_series,
     };
 
     tokio::spawn(ingest_worker(

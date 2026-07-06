@@ -93,7 +93,18 @@ pub(crate) async fn post_metrics_batch(
     State(state): State<AppState>,
     Json(payload): Json<MetricsBatchRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    match state.metrics_tx.try_send(payload) {
+    let metrics = state.label_governance.apply_batch(payload.metrics)?;
+    if metrics.is_empty() {
+        return Ok((
+            StatusCode::OK,
+            Json(ApiResponse::<serde_json::Value> {
+                message: "Request Successful.".to_string(),
+                code: None,
+                data: None,
+            }),
+        ));
+    }
+    match state.metrics_tx.try_send(MetricsBatchRequest { metrics }) {
         Ok(()) => Ok((
             StatusCode::OK,
             Json(ApiResponse::<serde_json::Value> {
@@ -262,6 +273,8 @@ pub(crate) async fn get_metrics_query(
     let group_by_keys = parse_group_by_keys(q.group_by.as_deref());
 
     let project_id = state.default_project_id.as_ref();
+    let max_series = state.metrics_query_max_series as i64;
+    let max_points = state.metrics_query_max_points_per_series as i64;
 
     let mut series_map: BTreeMap<String, MetricsSeries> = BTreeMap::new();
     let mut points_truncated = false;
@@ -282,9 +295,6 @@ pub(crate) async fn get_metrics_query(
                 "p99" => "(percentile_cont(0.99) WITHIN GROUP (ORDER BY value))::DOUBLE PRECISION",
                 _ => unreachable!(),
             };
-
-            const MAX_POINTS_PER_SERIES: i64 = 1000;
-            const MAX_SERIES: i64 = 50;
 
             let mut builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
                 "WITH filtered AS (\n  SELECT\n    to_timestamp(floor(extract(epoch from timestamp) / ",
@@ -336,9 +346,9 @@ pub(crate) async fn get_metrics_query(
             builder.push(
                 "\n),\nranked AS (\n  SELECT\n    bucket_ts,\n    labels,\n    value,\n    ROW_NUMBER() OVER (PARTITION BY labels ORDER BY bucket_ts ASC) AS point_rank,\n    DENSE_RANK() OVER (ORDER BY labels) AS series_rank\n  FROM aggregated\n)\nSELECT\n  bucket_ts,\n  labels,\n  value,\n  point_rank,\n  series_rank\nFROM ranked\nWHERE point_rank <= ",
             );
-            builder.push_bind(MAX_POINTS_PER_SERIES);
+            builder.push_bind(max_points);
             builder.push(" AND series_rank <= ");
-            builder.push_bind(MAX_SERIES);
+            builder.push_bind(max_series);
             builder.push("\nORDER BY labels, bucket_ts ASC");
 
             #[derive(Debug, sqlx::FromRow)]
@@ -354,11 +364,11 @@ pub(crate) async fn get_metrics_query(
                 builder.build_query_as().fetch_all(pool).await?;
 
             for r in rows {
-                if r.point_rank > MAX_POINTS_PER_SERIES {
+                if r.point_rank > max_points {
                     points_truncated = true;
                     continue;
                 }
-                if r.series_rank > MAX_SERIES {
+                if r.series_rank > max_series {
                     series_truncated = true;
                     continue;
                 }
@@ -421,18 +431,23 @@ pub(crate) async fn get_metrics_query(
             }
 
             let total_series = grouped.len();
-            if total_series > 50 {
+            if total_series > state.metrics_query_max_series {
                 series_truncated = true;
             }
 
-            for (key, (final_labels, buckets)) in grouped.into_iter().take(50) {
+            for (key, (final_labels, buckets)) in
+                grouped.into_iter().take(state.metrics_query_max_series)
+            {
                 let mut values_vec = Vec::new();
                 let total_buckets = buckets.len();
-                if total_buckets > 1000 {
+                if total_buckets > state.metrics_query_max_points_per_series {
                     points_truncated = true;
                 }
 
-                for (bucket_ts, mut pts) in buckets.into_iter().take(1000) {
+                for (bucket_ts, mut pts) in buckets
+                    .into_iter()
+                    .take(state.metrics_query_max_points_per_series)
+                {
                     match latest_bucket {
                         Some(prev) if bucket_ts > prev => latest_bucket = Some(bucket_ts),
                         None => latest_bucket = Some(bucket_ts),

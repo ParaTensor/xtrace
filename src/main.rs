@@ -1,4 +1,7 @@
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use xtrace::metrics::label_governance::{
+    parse_label_key_set, LabelGovernanceConfig, LabelOverflowPolicy,
+};
 use xtrace::{run_server, ServerConfig};
 
 #[tokio::main]
@@ -88,6 +91,39 @@ async fn main() -> anyhow::Result<()> {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(20 * 1024 * 1024),
+        label_governance: LabelGovernanceConfig {
+            max_labels_per_point: std::env::var("XTRACE_METRICS_MAX_LABELS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(64),
+            max_label_value_len: std::env::var("XTRACE_METRICS_MAX_LABEL_VALUE_LEN")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(256),
+            allow_keys: parse_label_key_set(
+                std::env::var("XTRACE_METRICS_LABEL_ALLOWLIST")
+                    .ok()
+                    .as_deref(),
+            ),
+            deny_keys: parse_label_key_set(
+                std::env::var("XTRACE_METRICS_LABEL_DENYLIST")
+                    .ok()
+                    .as_deref(),
+            )
+            .unwrap_or_default(),
+            overflow_policy: std::env::var("XTRACE_METRICS_LABEL_OVERFLOW_POLICY")
+                .ok()
+                .and_then(|v| LabelOverflowPolicy::parse(&v))
+                .unwrap_or(LabelOverflowPolicy::DropLabels),
+        },
+        metrics_query_max_series: std::env::var("XTRACE_METRICS_QUERY_MAX_SERIES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50),
+        metrics_query_max_points_per_series: std::env::var("XTRACE_METRICS_QUERY_MAX_POINTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1000),
     };
 
     run_server(config).await
