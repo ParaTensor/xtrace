@@ -7,27 +7,39 @@ use axum::{
 use bytes::Bytes;
 use chrono::{DateTime, TimeZone, Utc};
 use flate2::read::GzDecoder;
+use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest as PbExportMetricsServiceRequest;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest as PbExportTraceServiceRequest;
+use opentelemetry_proto::tonic::common::v1::{
+    any_value::Value as PbAnyValue, AnyValue as PbAnyValueMsg,
+    InstrumentationScope as PbInstrumentationScope, KeyValue as PbKeyValue,
+};
+use opentelemetry_proto::tonic::metrics::v1::{
+    metric::Data as PbMetricData, HistogramDataPoint as PbHistogramDataPoint,
+    NumberDataPoint as PbNumberDataPoint,
+};
 use prost::Message;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
-use std::io::Read;
+use std::{collections::HashMap, io::Read};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::{
-    http::error::ApiError,
+    http::{
+        error::ApiError,
+        metrics::{MetricPointIngest, MetricsBatchRequest},
+    },
     ingest::batch::{BatchIngestRequest, ObservationIngest, TraceIngest},
     state::AppState,
 };
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct OtelExportTraceServiceRequest {
     resource_spans: Vec<OtelResourceSpan>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct OtelResourceSpan {
     #[serde(default)]
@@ -36,21 +48,21 @@ struct OtelResourceSpan {
     scope_spans: Vec<OtelScopeSpan>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct OtelResource {
     #[serde(default)]
     attributes: Vec<OtelKeyValue>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct OtelScopeSpan {
     #[serde(default)]
     spans: Vec<OtelSpan>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct OtelSpan {
     trace_id: String,
@@ -66,7 +78,7 @@ struct OtelSpan {
     attributes: Vec<OtelKeyValue>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct OtelKeyValue {
     key: String,
@@ -74,7 +86,7 @@ struct OtelKeyValue {
     value: Option<OtelAnyValue>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct OtelAnyValue {
     #[serde(default)]
@@ -89,11 +101,113 @@ struct OtelAnyValue {
     array_value: Option<OtelArrayValue>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct OtelArrayValue {
     #[serde(default)]
     values: Vec<OtelAnyValue>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OtelExportMetricsServiceRequest {
+    resource_metrics: Vec<OtelResourceMetrics>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OtelResourceMetrics {
+    #[serde(default)]
+    resource: Option<OtelMetricsResource>,
+    #[serde(default)]
+    scope_metrics: Vec<OtelScopeMetrics>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OtelMetricsResource {
+    #[serde(default)]
+    attributes: Vec<OtelKeyValue>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OtelScopeMetrics {
+    #[serde(default)]
+    scope: Option<OtelInstrumentationScope>,
+    #[serde(default)]
+    metrics: Vec<OtelMetric>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OtelInstrumentationScope {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    version: String,
+    #[serde(default)]
+    attributes: Vec<OtelKeyValue>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OtelMetric {
+    name: String,
+    #[serde(default)]
+    gauge: Option<OtelGauge>,
+    #[serde(default)]
+    sum: Option<OtelSum>,
+    #[serde(default)]
+    histogram: Option<OtelHistogram>,
+    #[serde(default, rename = "exponentialHistogram")]
+    exponential_histogram: Option<JsonValue>,
+    #[serde(default)]
+    summary: Option<JsonValue>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OtelGauge {
+    #[serde(default)]
+    data_points: Vec<OtelNumberDataPoint>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OtelSum {
+    #[serde(default)]
+    data_points: Vec<OtelNumberDataPoint>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OtelHistogram {
+    #[serde(default)]
+    data_points: Vec<OtelHistogramDataPoint>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OtelNumberDataPoint {
+    #[serde(default)]
+    attributes: Vec<OtelKeyValue>,
+    time_unix_nano: String,
+    #[serde(default, rename = "asDouble")]
+    as_double: Option<f64>,
+    #[serde(default, rename = "asInt")]
+    as_int: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OtelHistogramDataPoint {
+    #[serde(default)]
+    attributes: Vec<OtelKeyValue>,
+    time_unix_nano: String,
+    count: u64,
+    #[serde(default)]
+    sum: Option<f64>,
 }
 
 fn decode_hex(s: &str) -> Option<Vec<u8>> {
@@ -140,6 +254,16 @@ fn otel_span_id_to_uuid(span_id: &str) -> Option<Uuid> {
 fn unix_nano_to_datetime(v: &Option<String>) -> Option<DateTime<Utc>> {
     let s = v.as_deref()?.trim();
     let nanos: i128 = s.parse().ok()?;
+    if nanos <= 0 {
+        return None;
+    }
+    let secs = (nanos / 1_000_000_000) as i64;
+    let sub_nanos = (nanos % 1_000_000_000) as u32;
+    Utc.timestamp_opt(secs, sub_nanos).single()
+}
+
+fn unix_nano_to_datetime_str(v: &str) -> Option<DateTime<Utc>> {
+    let nanos: i128 = v.trim().parse().ok()?;
     if nanos <= 0 {
         return None;
     }
@@ -209,6 +333,70 @@ fn extract_array_string_attr(attrs: &[OtelKeyValue], key: &str) -> Option<Vec<St
         }
     }
     Some(out)
+}
+
+fn otel_any_value_to_label(v: &OtelAnyValue) -> String {
+    if let Some(s) = &v.string_value {
+        return s.clone();
+    }
+    if let Some(s) = &v.int_value {
+        return s.clone();
+    }
+    if let Some(f) = v.double_value {
+        return f.to_string();
+    }
+    if let Some(b) = v.bool_value {
+        return b.to_string();
+    }
+    if let Some(arr) = &v.array_value {
+        return serde_json::to_string(&otel_any_value_to_json(&OtelAnyValue {
+            string_value: None,
+            int_value: None,
+            double_value: None,
+            bool_value: None,
+            array_value: Some(OtelArrayValue {
+                values: arr.values.clone(),
+            }),
+        }))
+        .unwrap_or_default();
+    }
+    String::new()
+}
+
+fn key_values_to_labels(attrs: &[OtelKeyValue]) -> HashMap<String, String> {
+    let mut labels = HashMap::with_capacity(attrs.len());
+    for kv in attrs {
+        if let Some(value) = &kv.value {
+            labels.insert(kv.key.clone(), otel_any_value_to_label(value));
+        }
+    }
+    labels
+}
+
+fn merge_labels(
+    resource_attrs: &[OtelKeyValue],
+    scope: Option<&OtelInstrumentationScope>,
+) -> HashMap<String, String> {
+    let mut labels = key_values_to_labels(resource_attrs);
+    if let Some(scope) = scope {
+        if !scope.name.is_empty() {
+            labels.insert("otel.scope.name".to_string(), scope.name.clone());
+        }
+        if !scope.version.is_empty() {
+            labels.insert("otel.scope.version".to_string(), scope.version.clone());
+        }
+        labels.extend(key_values_to_labels(&scope.attributes));
+    }
+    labels
+}
+
+fn unix_nano_to_datetime_u64(v: u64) -> Option<DateTime<Utc>> {
+    if v == 0 {
+        return None;
+    }
+    let secs = (v / 1_000_000_000) as i64;
+    let sub_nanos = (v % 1_000_000_000) as u32;
+    Utc.timestamp_opt(secs, sub_nanos).single()
 }
 
 fn extract_prefixed_map(
@@ -682,6 +870,363 @@ fn pb_to_otel_json(payload: PbExportTraceServiceRequest) -> OtelExportTraceServi
     OtelExportTraceServiceRequest { resource_spans }
 }
 
+fn push_metric_point(
+    points: &mut Vec<MetricPointIngest>,
+    name: impl Into<String>,
+    labels: HashMap<String, String>,
+    value: f64,
+    timestamp: Option<DateTime<Utc>>,
+) {
+    let Some(timestamp) = timestamp else {
+        return;
+    };
+
+    points.push(MetricPointIngest {
+        name: name.into(),
+        labels,
+        value,
+        timestamp,
+    });
+}
+
+fn push_number_data_points(
+    points: &mut Vec<MetricPointIngest>,
+    metric_name: &str,
+    resource_attrs: &[OtelKeyValue],
+    scope: Option<&OtelInstrumentationScope>,
+    data_points: &[OtelNumberDataPoint],
+) {
+    for dp in data_points {
+        let value = match (dp.as_double, dp.as_int) {
+            (Some(v), _) => v,
+            (_, Some(v)) => v as f64,
+            _ => continue,
+        };
+        let labels = merge_labels(resource_attrs, scope)
+            .into_iter()
+            .chain(key_values_to_labels(&dp.attributes).into_iter())
+            .collect::<HashMap<_, _>>();
+        push_metric_point(
+            points,
+            metric_name.to_string(),
+            labels,
+            value,
+            unix_nano_to_datetime_str(&dp.time_unix_nano),
+        );
+    }
+}
+
+fn push_histogram_data_points(
+    points: &mut Vec<MetricPointIngest>,
+    metric_name: &str,
+    resource_attrs: &[OtelKeyValue],
+    scope: Option<&OtelInstrumentationScope>,
+    data_points: &[OtelHistogramDataPoint],
+) {
+    for dp in data_points {
+        let labels = merge_labels(resource_attrs, scope)
+            .into_iter()
+            .chain(key_values_to_labels(&dp.attributes).into_iter())
+            .collect::<HashMap<_, _>>();
+        let ts = unix_nano_to_datetime_str(&dp.time_unix_nano);
+
+        push_metric_point(
+            points,
+            format!("{metric_name}_count"),
+            labels.clone(),
+            dp.count as f64,
+            ts,
+        );
+
+        if let Some(sum) = dp.sum {
+            push_metric_point(points, format!("{metric_name}_sum"), labels, sum, ts);
+        } else {
+            tracing::debug!(metric = metric_name, "skipping histogram sum without sum");
+        }
+
+        // xtrace computes quantiles over raw sample points; histogram-derived
+        // rows are compatibility shims for OTLP histogram input only.
+    }
+}
+
+fn json_metrics_to_batch(payload: OtelExportMetricsServiceRequest) -> MetricsBatchRequest {
+    let mut points = Vec::new();
+
+    for rm in payload.resource_metrics {
+        let resource_attrs = rm
+            .resource
+            .as_ref()
+            .map(|r| r.attributes.as_slice())
+            .unwrap_or(&[]);
+
+        for sm in rm.scope_metrics {
+            let scope = sm.scope.as_ref();
+            for metric in sm.metrics {
+                let metric_name = metric.name.clone();
+                if let Some(gauge) = metric.gauge.as_ref() {
+                    push_number_data_points(
+                        &mut points,
+                        &metric_name,
+                        resource_attrs,
+                        scope,
+                        &gauge.data_points,
+                    );
+                    continue;
+                }
+                if let Some(sum) = metric.sum.as_ref() {
+                    push_number_data_points(
+                        &mut points,
+                        &metric_name,
+                        resource_attrs,
+                        scope,
+                        &sum.data_points,
+                    );
+                    continue;
+                }
+                if let Some(histogram) = metric.histogram.as_ref() {
+                    push_histogram_data_points(
+                        &mut points,
+                        &metric_name,
+                        resource_attrs,
+                        scope,
+                        &histogram.data_points,
+                    );
+                    continue;
+                }
+                if metric.exponential_histogram.is_some() {
+                    tracing::debug!(metric = %metric_name, "skipping OTLP exponential histogram metric");
+                    continue;
+                }
+                if metric.summary.is_some() {
+                    tracing::debug!(metric = %metric_name, "skipping OTLP summary metric");
+                    continue;
+                }
+                tracing::debug!(metric = %metric_name, "skipping OTLP metric without data");
+            }
+        }
+    }
+
+    MetricsBatchRequest { metrics: points }
+}
+
+fn pb_any_value_to_json(v: &PbAnyValueMsg) -> JsonValue {
+    match v.value.as_ref() {
+        Some(PbAnyValue::StringValue(s)) => JsonValue::String(s.clone()),
+        Some(PbAnyValue::BoolValue(b)) => JsonValue::Bool(*b),
+        Some(PbAnyValue::IntValue(i)) => JsonValue::Number((*i).into()),
+        Some(PbAnyValue::DoubleValue(f)) => serde_json::Number::from_f64(*f)
+            .map(JsonValue::Number)
+            .unwrap_or(JsonValue::Null),
+        Some(PbAnyValue::ArrayValue(arr)) => {
+            JsonValue::Array(arr.values.iter().map(pb_any_value_to_json).collect())
+        }
+        Some(PbAnyValue::KvlistValue(list)) => {
+            let mut map = serde_json::Map::new();
+            for kv in &list.values {
+                if let Some(value) = &kv.value {
+                    map.insert(kv.key.clone(), pb_any_value_to_json(value));
+                }
+            }
+            JsonValue::Object(map)
+        }
+        Some(PbAnyValue::BytesValue(bytes)) => JsonValue::String(hex::encode(bytes)),
+        None => JsonValue::Null,
+    }
+}
+
+fn pb_any_value_to_label(v: &PbAnyValueMsg) -> String {
+    match pb_any_value_to_json(v) {
+        JsonValue::String(s) => s,
+        JsonValue::Number(n) => n.to_string(),
+        JsonValue::Bool(b) => b.to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn pb_key_values_to_labels(attrs: &[PbKeyValue]) -> HashMap<String, String> {
+    let mut labels = HashMap::with_capacity(attrs.len());
+    for kv in attrs {
+        if let Some(value) = &kv.value {
+            labels.insert(kv.key.clone(), pb_any_value_to_label(value));
+        }
+    }
+    labels
+}
+
+fn pb_merge_labels(
+    resource_attrs: &[PbKeyValue],
+    scope: Option<&PbInstrumentationScope>,
+    attrs: &[PbKeyValue],
+) -> HashMap<String, String> {
+    let mut labels = pb_key_values_to_labels(resource_attrs);
+    if let Some(scope) = scope {
+        if !scope.name.is_empty() {
+            labels.insert("otel.scope.name".to_string(), scope.name.clone());
+        }
+        if !scope.version.is_empty() {
+            labels.insert("otel.scope.version".to_string(), scope.version.clone());
+        }
+        labels.extend(pb_key_values_to_labels(&scope.attributes));
+    }
+    labels.extend(pb_key_values_to_labels(attrs));
+    labels
+}
+
+fn pb_number_data_points_to_batch(
+    points: &mut Vec<MetricPointIngest>,
+    metric_name: &str,
+    resource_attrs: &[PbKeyValue],
+    scope: Option<&PbInstrumentationScope>,
+    attrs: &[PbKeyValue],
+    data_points: &[PbNumberDataPoint],
+) {
+    for dp in data_points {
+        let Some(ts) = unix_nano_to_datetime_u64(dp.time_unix_nano) else {
+            continue;
+        };
+        let value = match dp.value.as_ref() {
+            Some(opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsDouble(
+                v,
+            )) => *v,
+            Some(opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsInt(v)) => {
+                *v as f64
+            }
+            None => continue,
+        };
+        let labels = pb_merge_labels(resource_attrs, scope, attrs)
+            .into_iter()
+            .chain(pb_key_values_to_labels(&dp.attributes).into_iter())
+            .collect::<HashMap<_, _>>();
+        push_metric_point(points, metric_name.to_string(), labels, value, Some(ts));
+    }
+}
+
+fn pb_histogram_data_points_to_batch(
+    points: &mut Vec<MetricPointIngest>,
+    metric_name: &str,
+    resource_attrs: &[PbKeyValue],
+    scope: Option<&PbInstrumentationScope>,
+    attrs: &[PbKeyValue],
+    data_points: &[PbHistogramDataPoint],
+) {
+    for dp in data_points {
+        let Some(ts) = unix_nano_to_datetime_u64(dp.time_unix_nano) else {
+            continue;
+        };
+        let labels = pb_merge_labels(resource_attrs, scope, attrs)
+            .into_iter()
+            .chain(pb_key_values_to_labels(&dp.attributes).into_iter())
+            .collect::<HashMap<_, _>>();
+
+        push_metric_point(
+            points,
+            format!("{metric_name}_count"),
+            labels.clone(),
+            dp.count as f64,
+            Some(ts),
+        );
+        if let Some(sum) = dp.sum {
+            push_metric_point(points, format!("{metric_name}_sum"), labels, sum, Some(ts));
+        } else {
+            tracing::debug!(metric = metric_name, "skipping histogram sum without sum");
+        }
+
+        // xtrace computes true quantiles over raw sample points; these
+        // derived rows are OTLP compatibility shims only.
+    }
+}
+
+fn json_otel_metrics_to_batch(payload: OtelExportMetricsServiceRequest) -> MetricsBatchRequest {
+    json_metrics_to_batch(payload)
+}
+
+fn pb_otel_metrics_to_batch(payload: PbExportMetricsServiceRequest) -> MetricsBatchRequest {
+    let mut points = Vec::new();
+
+    for rm in payload.resource_metrics {
+        let resource_attrs = rm
+            .resource
+            .as_ref()
+            .map(|r| r.attributes.as_slice())
+            .unwrap_or(&[]);
+        for sm in rm.scope_metrics {
+            let scope = sm.scope.as_ref();
+            for metric in sm.metrics {
+                let metric_name = metric.name;
+                match metric.data {
+                    Some(PbMetricData::Gauge(gauge)) => pb_number_data_points_to_batch(
+                        &mut points,
+                        &metric_name,
+                        resource_attrs,
+                        scope,
+                        &[],
+                        &gauge.data_points,
+                    ),
+                    Some(PbMetricData::Sum(sum)) => pb_number_data_points_to_batch(
+                        &mut points,
+                        &metric_name,
+                        resource_attrs,
+                        scope,
+                        &[],
+                        &sum.data_points,
+                    ),
+                    Some(PbMetricData::Histogram(histogram)) => pb_histogram_data_points_to_batch(
+                        &mut points,
+                        &metric_name,
+                        resource_attrs,
+                        scope,
+                        &[],
+                        &histogram.data_points,
+                    ),
+                    Some(PbMetricData::ExponentialHistogram(_)) => {
+                        tracing::debug!(metric = %metric_name, "skipping OTLP exponential histogram metric")
+                    }
+                    Some(PbMetricData::Summary(_)) => {
+                        tracing::debug!(metric = %metric_name, "skipping OTLP summary metric")
+                    }
+                    None => {
+                        tracing::debug!(metric = %metric_name, "skipping OTLP metric without data")
+                    }
+                }
+            }
+        }
+    }
+
+    MetricsBatchRequest { metrics: points }
+}
+
+pub(crate) async fn post_otel_metrics(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, ApiError> {
+    let raw = ungzip_if_needed(&headers, body)?;
+    let ct = content_type(&headers).unwrap_or_else(|| "application/json".to_string());
+
+    let batch = if ct == "application/json" {
+        let otel: OtelExportMetricsServiceRequest = serde_json::from_slice(&raw)
+            .map_err(|e| ApiError::BadRequest(format!("invalid json: {e}")))?;
+        json_otel_metrics_to_batch(otel)
+    } else if ct == "application/x-protobuf" {
+        let pb = PbExportMetricsServiceRequest::decode(raw.as_slice())
+            .map_err(|e| ApiError::BadRequest(format!("invalid protobuf: {e}")))?;
+        pb_otel_metrics_to_batch(pb)
+    } else {
+        return Err(ApiError::BadRequest(format!(
+            "unsupported content-type: {ct}"
+        )));
+    };
+
+    if !batch.metrics.is_empty() {
+        state.metrics_tx.try_send(batch).map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => ApiError::TooManyRequests,
+            mpsc::error::TrySendError::Closed(_) => ApiError::ServiceUnavailable,
+        })?;
+    }
+
+    Ok((StatusCode::OK, Json(serde_json::json!({}))))
+}
+
 pub(crate) async fn post_otel_traces(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -712,4 +1257,46 @@ pub(crate) async fn post_otel_traces(
     }
 
     Ok((StatusCode::OK, Json(serde_json::json!({}))))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_metrics_mapping_emits_points() {
+        let payload: OtelExportMetricsServiceRequest = serde_json::from_value(serde_json::json!({
+            "resourceMetrics": [{
+                "resource": {
+                    "attributes": [
+                        {"key": "service.name", "value": {"stringValue": "svc"}}
+                    ]
+                },
+                "scopeMetrics": [{
+                    "scope": {"name": "scope"},
+                    "metrics": [{
+                        "name": "cpu_temp",
+                        "gauge": {
+                            "dataPoints": [{
+                                "attributes": [
+                                    {"key": "room", "value": {"stringValue": "lab"}}
+                                ],
+                                "timeUnixNano": "1700000000000000000",
+                                "asDouble": 42.5
+                            }]
+                        }
+                    }]
+                }]
+            }]
+        }))
+        .unwrap();
+
+        let batch = json_otel_metrics_to_batch(payload);
+        assert_eq!(batch.metrics.len(), 1);
+        assert_eq!(batch.metrics[0].name, "cpu_temp");
+        assert_eq!(batch.metrics[0].value, 42.5);
+        assert_eq!(batch.metrics[0].labels["service.name"], "svc");
+        assert_eq!(batch.metrics[0].labels["otel.scope.name"], "scope");
+        assert_eq!(batch.metrics[0].labels["room"], "lab");
+    }
 }

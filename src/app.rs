@@ -38,6 +38,7 @@ pub fn build_router(state: AppState, max_body: usize) -> Router {
         .route("/v1/metrics/batch", post(post_metrics_batch))
         .route("/api/public/projects", get(get_projects))
         .route("/api/public/otel/v1/traces", post(otlp::post_otel_traces))
+        .route("/api/public/otel/v1/metrics", post(otlp::post_otel_metrics))
         .route("/api/public/media", post(media::post_media))
         .route(
             "/api/public/media/:mediaId",

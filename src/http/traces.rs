@@ -547,10 +547,8 @@ SELECT
                             return false;
                         }
                     }
-                    if !q.tags.is_empty() {
-                        if !q.tags.iter().all(|tag| t.tags.contains(tag)) {
-                            return false;
-                        }
+                    if !q.tags.is_empty() && !q.tags.iter().all(|tag| t.tags.contains(tag)) {
+                        return false;
                     }
                     if let Some(ref version) = q.version {
                         if t.version.as_ref() != Some(version) {
@@ -562,10 +560,8 @@ SELECT
                             return false;
                         }
                     }
-                    if !q.environment.is_empty() {
-                        if !q.environment.contains(&t.environment) {
-                            return false;
-                        }
+                    if !q.environment.is_empty() && !q.environment.contains(&t.environment) {
+                        return false;
                     }
                     true
                 })

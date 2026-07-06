@@ -62,7 +62,10 @@ pub(crate) async fn auth(
     next: Next,
 ) -> impl IntoResponse {
     let path = request.uri().path();
-    let is_langfuse_compat = matches!(path, "/api/public/projects" | "/api/public/otel/v1/traces");
+    let is_langfuse_compat = matches!(
+        path,
+        "/api/public/projects" | "/api/public/otel/v1/traces" | "/api/public/otel/v1/metrics"
+    );
     let langfuse_auth_not_configured =
         state.langfuse_public_key.is_none() && state.langfuse_secret_key.is_none();
     let open_compat = state.allow_unauthenticated_compat && langfuse_auth_not_configured;

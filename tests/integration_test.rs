@@ -3,11 +3,24 @@ use axum::{
     http::{header, Request, StatusCode},
 };
 use chrono::Utc;
+use opentelemetry_proto::tonic::{
+    collector::metrics::v1::ExportMetricsServiceRequest as PbExportMetricsServiceRequest,
+    common::v1::{
+        any_value::Value as PbAnyValue, AnyValue as PbAnyValueMsg,
+        InstrumentationScope as PbInstrumentationScope, KeyValue as PbKeyValue,
+    },
+    metrics::v1::{
+        metric::Data as PbMetricData, Gauge as PbGauge, Metric as PbMetric,
+        NumberDataPoint as PbNumberDataPoint, ResourceMetrics as PbResourceMetrics,
+        ScopeMetrics as PbScopeMetrics,
+    },
+};
+use prost::Message;
 use serde_json::{json, Value};
 use sqlx::postgres::PgPoolOptions;
 use tower::ServiceExt;
 use uuid::Uuid;
-use xtrace::test_app::setup_test_router;
+use xtrace::test_app::{setup_mock_router, setup_test_router};
 
 async fn setup_app() -> (axum::Router, String) {
     let database_url =
@@ -32,6 +45,31 @@ fn authed_request(method: &str, uri: &str, token: &str, body: Option<Value>) -> 
     } else {
         builder.body(Body::empty()).unwrap()
     }
+}
+
+async fn wait_for_metric_query(app: &axum::Router, token: &str, name: &str, agg: &str) -> Value {
+    let uri = format!("/api/public/metrics/query?name={name}&step=1m&agg={agg}");
+    for _ in 0..20 {
+        let response = app
+            .clone()
+            .oneshot(authed_request("GET", &uri, token, None))
+            .await
+            .unwrap();
+        if response.status() == StatusCode::OK {
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let data: Value = serde_json::from_slice(&bytes).unwrap();
+            if data["data"]
+                .as_array()
+                .is_some_and(|series| !series.is_empty())
+            {
+                return data;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("metric {name} did not appear");
 }
 
 #[tokio::test]
@@ -472,4 +510,222 @@ async fn in_memory_storage_integration_test() {
         error_data["data"][0]["traceId"].as_str(),
         Some(trace_id.to_string().as_str())
     );
+}
+
+#[tokio::test]
+async fn otlp_metrics_json_round_trip_and_auth() {
+    let app = setup_mock_router("metrics-test-token").await;
+    let token = "metrics-test-token";
+
+    let unauthorized = Request::builder()
+        .method("POST")
+        .uri("/api/public/otel/v1/metrics")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::empty())
+        .unwrap();
+    let unauthorized_response = app.clone().oneshot(unauthorized).await.unwrap();
+    assert_eq!(unauthorized_response.status(), StatusCode::UNAUTHORIZED);
+
+    let ts = Utc::now().timestamp_nanos_opt().unwrap().to_string();
+    let payload = json!({
+        "resourceMetrics": [{
+            "resource": {
+                "attributes": [
+                    {"key": "service.name", "value": {"stringValue": "checkout"}},
+                    {"key": "service.instance.id", "value": {"stringValue": "api-1"}}
+                ]
+            },
+            "scopeMetrics": [{
+                "scope": {
+                    "name": "shim",
+                    "version": "1.0.0",
+                    "attributes": [
+                        {"key": "otel.scope.kind", "value": {"stringValue": "test"}}
+                    ]
+                },
+                "metrics": [
+                    {
+                        "name": "cpu_temp",
+                        "gauge": {
+                            "dataPoints": [{
+                                "attributes": [
+                                    {"key": "room", "value": {"stringValue": "server"}}
+                                ],
+                                "timeUnixNano": ts,
+                                "asDouble": 42.5
+                            }]
+                        }
+                    },
+                    {
+                        "name": "req_count",
+                        "sum": {
+                            "dataPoints": [{
+                                "attributes": [
+                                    {"key": "route", "value": {"stringValue": "/chat"}}
+                                ],
+                                "timeUnixNano": ts,
+                                "asInt": 7
+                            }]
+                        }
+                    }
+                ]
+            }]
+        }]
+    });
+
+    let ingest = authed_request("POST", "/api/public/otel/v1/metrics", token, Some(payload));
+    let ingest_response = app.clone().oneshot(ingest).await.unwrap();
+    assert_eq!(ingest_response.status(), StatusCode::OK);
+
+    let cpu_data = wait_for_metric_query(&app, token, "cpu_temp", "avg").await;
+    assert_eq!(cpu_data["data"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        cpu_data["data"][0]["values"][0]["value"].as_f64(),
+        Some(42.5)
+    );
+    assert_eq!(cpu_data["data"][0]["labels"]["service.name"], "checkout");
+    assert_eq!(cpu_data["data"][0]["labels"]["otel.scope.name"], "shim");
+    assert_eq!(cpu_data["data"][0]["labels"]["room"], "server");
+
+    let req_data = wait_for_metric_query(&app, token, "req_count", "avg").await;
+    assert_eq!(req_data["data"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        req_data["data"][0]["values"][0]["value"].as_f64(),
+        Some(7.0)
+    );
+    assert_eq!(req_data["data"][0]["labels"]["route"], "/chat");
+    assert_eq!(
+        req_data["data"][0]["labels"]["service.instance.id"],
+        "api-1"
+    );
+}
+
+#[tokio::test]
+async fn otlp_metrics_protobuf_round_trip() {
+    let app = setup_mock_router("metrics-test-token-proto").await;
+    let token = "metrics-test-token-proto";
+    let ts = Utc::now().timestamp_nanos_opt().unwrap() as u64;
+
+    let request = PbExportMetricsServiceRequest {
+        resource_metrics: vec![PbResourceMetrics {
+            resource: Some(opentelemetry_proto::tonic::resource::v1::Resource {
+                attributes: vec![PbKeyValue {
+                    key: "service.name".to_string(),
+                    value: Some(PbAnyValueMsg {
+                        value: Some(PbAnyValue::StringValue("billing".to_string())),
+                    }),
+                }],
+                dropped_attributes_count: 0,
+                entity_refs: vec![],
+            }),
+            scope_metrics: vec![PbScopeMetrics {
+                scope: Some(PbInstrumentationScope {
+                    name: "proto-shim".to_string(),
+                    version: "2.1.0".to_string(),
+                    attributes: vec![],
+                    dropped_attributes_count: 0,
+                }),
+                metrics: vec![PbMetric {
+                    name: "latency_ms".to_string(),
+                    description: String::new(),
+                    unit: String::new(),
+                    metadata: vec![],
+                    data: Some(PbMetricData::Gauge(PbGauge {
+                        data_points: vec![PbNumberDataPoint {
+                            attributes: vec![PbKeyValue {
+                                key: "endpoint".to_string(),
+                                value: Some(PbAnyValueMsg {
+                                    value: Some(PbAnyValue::StringValue(
+                                        "/v1/chat".to_string(),
+                                    )),
+                                }),
+                            }],
+                            start_time_unix_nano: 0,
+                            time_unix_nano: ts,
+                            exemplars: vec![],
+                            flags: 0,
+                            value: Some(
+                                opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsDouble(88.0),
+                            ),
+                        }],
+                    })),
+                }],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    };
+
+    let body = request.encode_to_vec();
+    let ingest = Request::builder()
+        .method("POST")
+        .uri("/api/public/otel/v1/metrics")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/x-protobuf")
+        .body(Body::from(body))
+        .unwrap();
+    let ingest_response = app.clone().oneshot(ingest).await.unwrap();
+    assert_eq!(ingest_response.status(), StatusCode::OK);
+
+    let data = wait_for_metric_query(&app, token, "latency_ms", "avg").await;
+    assert_eq!(data["data"].as_array().unwrap().len(), 1);
+    assert_eq!(data["data"][0]["values"][0]["value"].as_f64(), Some(88.0));
+    assert_eq!(data["data"][0]["labels"]["service.name"], "billing");
+    assert_eq!(data["data"][0]["labels"]["otel.scope.name"], "proto-shim");
+    assert_eq!(data["data"][0]["labels"]["endpoint"], "/v1/chat");
+}
+
+#[tokio::test]
+async fn otlp_histogram_emits_count_and_sum() {
+    let app = setup_mock_router("metrics-test-token-hist").await;
+    let token = "metrics-test-token-hist";
+    let ts = Utc::now().timestamp_nanos_opt().unwrap().to_string();
+
+    let payload = json!({
+        "resourceMetrics": [{
+            "resource": {
+                "attributes": [
+                    {"key": "service.name", "value": {"stringValue": "hist-svc"}}
+                ]
+            },
+            "scopeMetrics": [{
+                "scope": {"name": "hist-shim", "version": "1.0.0"},
+                "metrics": [{
+                    "name": "request_duration_ms",
+                    "histogram": {
+                        "dataPoints": [{
+                            "attributes": [
+                                {"key": "route", "value": {"stringValue": "/search"}}
+                            ],
+                            "timeUnixNano": ts,
+                            "count": 4,
+                            "sum": 100.0,
+                            "bucketCounts": [1, 2, 1],
+                            "explicitBounds": [10.0, 50.0]
+                        }]
+                    }
+                }]
+            }]
+        }]
+    });
+
+    let ingest = authed_request("POST", "/api/public/otel/v1/metrics", token, Some(payload));
+    let ingest_response = app.clone().oneshot(ingest).await.unwrap();
+    assert_eq!(ingest_response.status(), StatusCode::OK);
+
+    let count_data = wait_for_metric_query(&app, token, "request_duration_ms_count", "sum").await;
+    assert_eq!(count_data["data"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        count_data["data"][0]["values"][0]["value"].as_f64(),
+        Some(4.0)
+    );
+
+    let sum_data = wait_for_metric_query(&app, token, "request_duration_ms_sum", "sum").await;
+    assert_eq!(sum_data["data"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        sum_data["data"][0]["values"][0]["value"].as_f64(),
+        Some(100.0)
+    );
+    assert_eq!(sum_data["data"][0]["labels"]["service.name"], "hist-svc");
+    assert_eq!(sum_data["data"][0]["labels"]["route"], "/search");
 }

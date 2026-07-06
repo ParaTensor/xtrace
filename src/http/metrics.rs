@@ -74,6 +74,23 @@ struct MetricsQueryResponse {
     meta: MetricsQueryMeta,
 }
 
+type MetricSeriesGroups = BTreeMap<
+    String,
+    (
+        JsonValue,
+        BTreeMap<DateTime<Utc>, Vec<(f64, DateTime<Utc>)>>,
+    ),
+>;
+
+type ModelGroupStats = (
+    i64,
+    i64,
+    i64,
+    std::collections::HashSet<uuid::Uuid>,
+    i64,
+    f64,
+);
+
 pub(crate) async fn post_metrics_batch(
     State(state): State<AppState>,
     Json(payload): Json<MetricsBatchRequest>,
@@ -304,13 +321,7 @@ pub(crate) async fn get_metrics_query(
                 .lock()
                 .map_err(|e| ApiError::Internal(format!("Mutex lock error: {e}")))?;
 
-            let mut grouped: BTreeMap<
-                String,
-                (
-                    JsonValue,
-                    BTreeMap<DateTime<Utc>, Vec<(f64, DateTime<Utc>)>>,
-                ),
-            > = BTreeMap::new();
+            let mut grouped: MetricSeriesGroups = BTreeMap::new();
 
             for m in metrics_guard.iter() {
                 if m.project_id != project_id
@@ -599,10 +610,8 @@ pub(crate) async fn get_metrics_daily(
                             return false;
                         }
                     }
-                    if !q.tags.is_empty() {
-                        if !q.tags.iter().all(|tag| t.tags.contains(tag)) {
-                            return false;
-                        }
+                    if !q.tags.is_empty() && !q.tags.iter().all(|tag| t.tags.contains(tag)) {
+                        return false;
                     }
                     if let Some(ref version) = q.version {
                         if t.version.as_ref() != Some(version) {
@@ -650,17 +659,7 @@ pub(crate) async fn get_metrics_daily(
                 let count_observations = obs.len() as i64;
                 let total_cost: f64 = traces.iter().map(|t| t.total_cost.unwrap_or(0.0)).sum();
 
-                let mut model_groups: HashMap<
-                    String,
-                    (
-                        i64,
-                        i64,
-                        i64,
-                        std::collections::HashSet<uuid::Uuid>,
-                        i64,
-                        f64,
-                    ),
-                > = HashMap::new();
+                let mut model_groups: HashMap<String, ModelGroupStats> = HashMap::new();
                 for o in obs.iter().filter(|o| o.r#type == "GENERATION") {
                     let model = o
                         .model
@@ -900,7 +899,7 @@ pub(crate) async fn get_metrics_overview(
     let from_ts = config
         .from_timestamp
         .unwrap_or_else(|| Utc::now() - chrono::Duration::days(365));
-    let to_ts = config.to_timestamp.unwrap_or_else(|| Utc::now());
+    let to_ts = config.to_timestamp.unwrap_or_else(Utc::now);
 
     if config.view == "traces" {
         let res = match &state.db {
