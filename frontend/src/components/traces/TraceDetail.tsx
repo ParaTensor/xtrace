@@ -50,10 +50,22 @@ const formatTokens = (obs: Observation) => {
   return `${obs.usage.input} → ${obs.usage.output}`;
 };
 
+const metadataString = (
+  metadata: Record<string, unknown>,
+  ...keys: string[]
+): string | undefined => {
+  for (const key of keys) {
+    const value = metadata[key];
+    if (typeof value === "string" && value) return value;
+    if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  }
+  return undefined;
+};
+
 const observationToNode = (observation: Observation): SpanNode => {
   const type = observation.type.toLowerCase();
-  const metadata = (observation.metadata as Record<string, any>) || {};
-  const stepType = metadata.step_type || metadata.stepType;
+  const metadata = observation.metadata ?? {};
+  const stepType = metadataString(metadata, "step_type", "stepType");
 
   const mappedType = ((): SpanNode["type"] => {
     if (type.includes("generation")) return "generation";
@@ -66,7 +78,7 @@ const observationToNode = (observation: Observation): SpanNode => {
     id: observation.id,
     name: observation.name || observation.type,
     type: mappedType,
-    stepType: typeof stepType === "string" ? stepType.toLowerCase() : undefined,
+    stepType: stepType?.toLowerCase(),
     latencyText: formatSeconds(observation.latency),
     costText: formatCost(observation.calculatedTotalCost ?? observation.totalPrice),
     tokensText: observation.usage ? formatTokens(observation) : undefined,
@@ -197,9 +209,9 @@ export function TraceDetail({ trace }: TraceDetailProps) {
   const spanRoots = useMemo(() => buildSpanTree(trace.observations), [trace.observations]);
   
   // Extract IDs from metadata for display
-  const metadata = (trace.metadata as Record<string, any>) || {};
-  const turnId = metadata.turn_id || metadata.turnId;
-  const runId = metadata.run_id || metadata.runId;
+  const metadata = trace.metadata ?? {};
+  const turnId = metadataString(metadata, "turn_id", "turnId");
+  const runId = metadataString(metadata, "run_id", "runId");
 
   return (
     <div className="flex flex-col h-full bg-card rounded-lg border border-border overflow-hidden">
