@@ -7,6 +7,7 @@ use crate::{
     app::build_router,
     http::metrics::{metrics_worker, MetricsBatchRequest},
     ingest::batch::{ingest_worker, BatchIngestRequest},
+    metrics::label_governance::LabelGovernance,
     state::{AppState, IngestStats, RateLimitStats},
 };
 
@@ -62,6 +63,9 @@ pub async fn setup_test_router(
         media_dir: Arc::from(media_dir),
         public_base_url: Some(Arc::from("http://127.0.0.1:8742")),
         media_max_content_length: 20 * 1024 * 1024,
+        label_governance: LabelGovernance::default(),
+        metrics_query_max_series: 50,
+        metrics_query_max_points_per_series: 1000,
     };
 
     Ok(build_router(state, 20 * 1024 * 1024))
@@ -110,6 +114,9 @@ pub async fn setup_mock_router(bearer_token: &str) -> Router {
         media_dir: Arc::from(media_dir),
         public_base_url: Some(Arc::from("http://127.0.0.1:8742")),
         media_max_content_length: 20 * 1024 * 1024,
+        label_governance: LabelGovernance::default(),
+        metrics_query_max_series: 50,
+        metrics_query_max_points_per_series: 1000,
     };
 
     build_router(state, 20 * 1024 * 1024)

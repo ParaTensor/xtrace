@@ -12,7 +12,11 @@ use std::sync::Mutex;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::{http::metrics::MetricsBatchRequest, ingest::batch::BatchIngestRequest};
+use crate::{
+    http::metrics::MetricsBatchRequest,
+    ingest::batch::BatchIngestRequest,
+    metrics::label_governance::{LabelGovernance, LabelGovernanceConfig},
+};
 
 pub type KeyedRateLimiter =
     governor::RateLimiter<String, governor::state::keyed::DashMapStateStore<String>, DefaultClock>;
@@ -130,6 +134,11 @@ pub struct ServerConfig {
     pub public_base_url: Option<String>,
     /// Maximum allowed media upload size in bytes.
     pub media_max_content_length: usize,
+    pub label_governance: LabelGovernanceConfig,
+    /// Max distinct label series returned by metrics query (per request).
+    pub metrics_query_max_series: usize,
+    /// Max data points per series returned by metrics query.
+    pub metrics_query_max_points_per_series: usize,
 }
 
 #[derive(Clone)]
@@ -150,6 +159,9 @@ pub struct AppState {
     pub media_dir: Arc<PathBuf>,
     pub public_base_url: Option<Arc<str>>,
     pub media_max_content_length: usize,
+    pub label_governance: LabelGovernance,
+    pub metrics_query_max_series: usize,
+    pub metrics_query_max_points_per_series: usize,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, sqlx::FromRow)]

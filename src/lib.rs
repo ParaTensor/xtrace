@@ -2,6 +2,7 @@ mod app;
 mod http;
 mod ingest;
 mod media;
+pub mod metrics;
 mod state;
 #[doc(hidden)]
 pub mod test_app;
