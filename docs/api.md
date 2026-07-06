@@ -327,6 +327,18 @@ Independent of Langfuse SDK, suitable for direct server requests, gateway forwar
 - `GET /api/public/metrics`
   Returns high-level overview metrics (trace count, latency avg/p95/p99) or observation metrics (distinct trace IDs with error status) over a specified time window.
   Primary use: Dashboard overview widgets compatibility for integrations (e.g., Xinference's `/v1/l/metric/overview`).
+  This is an overview endpoint, not a generic metrics timeseries query.
+
+- `GET /api/public/metrics/query`
+  Generic label-based metrics timeseries query over raw sample points.
+  Query params: `name`, optional `from` / `to`, optional `labels` JSON filter, optional `step` (`1m`, `5m`, `1h`, `1d`), optional `agg` (`avg`, `max`, `min`, `sum`, `last`, `count`, `p50`, `p90`, `p99`), and optional `group_by` as a comma-separated list of label keys.
+  Response shape: `{ data: [ { labels, values: [ { timestamp, value } ] } ], meta: { latest_ts, series_count, truncated } }`.
+  Note: `p50` / `p90` / `p99` are true quantiles over raw sample points. Histogram-derived `{name}_count` / `{name}_sum` points from OTLP ingest are compatibility shims, not a source of true quantiles.
+  `rate` / `increase` are intentionally not supported yet because xtrace stores raw samples, not cumulative counters.
+
+- `GET /api/public/metrics/names`
+  Returns the distinct metric names currently stored for the default project/environment.
+  Primary use: autocomplete / discovery for the query endpoint.
 
 - `GET /api/public/metrics/daily`
   Returns daily aggregated model invocation usage and cost statistics.
@@ -345,8 +357,12 @@ Independent of Langfuse SDK, suitable for direct server requests, gateway forwar
 | Endpoint                        | Method | Granularity      | Primary Use          |
 | ------------------------------- | ------ | ---------------- | -------------------- |
 | `/api/public/metrics`           | HTTP   | Overview metrics | Dashboard overview compatibility |
+| `/api/public/metrics/query`     | HTTP   | Time series      | Label-based metric query |
+| `/api/public/metrics/names`     | HTTP   | Discovery        | Metric name autocomplete |
 | `/api/public/metrics/daily`     | HTTP   | Daily aggregation| Usage / cost analytics   |
 | `/api/public/traces`            | HTTP   | Trace list       | Trace query and filtering|
 | `/api/public/traces/{trace_id}` | HTTP   | Single trace detail | Trace debugging and analysis |
+
+Metric naming and labels should follow OTel GenAI semantic conventions where applicable, for example `gen_ai.request.model` and `gen_ai.usage.input_tokens`. Keep high-cardinality values such as `user_id` and `request_id` out of metric labels; those belong on trace metadata and correlation fields instead.
 
 https://api.reference.langfuse.com/#tag/trace/GET/api/public/traces/{traceId}
