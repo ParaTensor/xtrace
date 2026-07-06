@@ -904,7 +904,7 @@ fn push_number_data_points(
         };
         let labels = merge_labels(resource_attrs, scope)
             .into_iter()
-            .chain(key_values_to_labels(&dp.attributes).into_iter())
+            .chain(key_values_to_labels(&dp.attributes))
             .collect::<HashMap<_, _>>();
         push_metric_point(
             points,
@@ -926,7 +926,7 @@ fn push_histogram_data_points(
     for dp in data_points {
         let labels = merge_labels(resource_attrs, scope)
             .into_iter()
-            .chain(key_values_to_labels(&dp.attributes).into_iter())
+            .chain(key_values_to_labels(&dp.attributes))
             .collect::<HashMap<_, _>>();
         let ts = unix_nano_to_datetime_str(&dp.time_unix_nano);
 
@@ -1095,7 +1095,7 @@ fn pb_number_data_points_to_batch(
         };
         let labels = pb_merge_labels(resource_attrs, scope, attrs)
             .into_iter()
-            .chain(pb_key_values_to_labels(&dp.attributes).into_iter())
+            .chain(pb_key_values_to_labels(&dp.attributes))
             .collect::<HashMap<_, _>>();
         push_metric_point(points, metric_name.to_string(), labels, value, Some(ts));
     }
@@ -1115,7 +1115,7 @@ fn pb_histogram_data_points_to_batch(
         };
         let labels = pb_merge_labels(resource_attrs, scope, attrs)
             .into_iter()
-            .chain(pb_key_values_to_labels(&dp.attributes).into_iter())
+            .chain(pb_key_values_to_labels(&dp.attributes))
             .collect::<HashMap<_, _>>();
 
         push_metric_point(
