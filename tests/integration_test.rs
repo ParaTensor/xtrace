@@ -255,6 +255,163 @@ async fn setup_mock_app() -> (axum::Router, String) {
     (router, token)
 }
 
+async fn metrics_query_response_json(
+    app: axum::Router,
+    method: &str,
+    uri: &str,
+    token: &str,
+    body: Option<Value>,
+) -> Value {
+    let response = app
+        .oneshot(authed_request(method, uri, token, body))
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "unexpected response body: {}",
+        String::from_utf8_lossy(&bytes)
+    );
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+#[tokio::test]
+async fn metrics_query_count_aggregation_round_trip() {
+    for (app, token) in [setup_app().await, setup_mock_app().await] {
+        let metric_name = format!("count_metric_{}", Uuid::new_v4());
+        let now = Utc::now();
+
+        for _ in 0..2 {
+            let write_response = app
+                .clone()
+                .oneshot(authed_request(
+                    "POST",
+                    "/v1/metrics/batch",
+                    &token,
+                    Some(json!({
+                        "metrics": [{
+                            "name": metric_name,
+                            "labels": {"node_id": "node-1"},
+                            "value": 1.0,
+                            "timestamp": now
+                        }]
+                    })),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(write_response.status(), StatusCode::OK);
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let query_data = metrics_query_response_json(
+            app,
+            "GET",
+            &format!("/api/public/metrics/query?name={metric_name}&step=1m&agg=count"),
+            &token,
+            None,
+        )
+        .await;
+
+        assert_eq!(query_data["meta"]["series_count"].as_u64(), Some(1));
+        assert_eq!(query_data["data"].as_array().unwrap().len(), 1);
+        assert_eq!(query_data["data"][0]["values"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            query_data["data"][0]["values"][0]["value"].as_f64(),
+            Some(2.0)
+        );
+    }
+}
+
+#[tokio::test]
+async fn metrics_query_multi_key_group_by_round_trip() {
+    for (app, token) in [setup_app().await, setup_mock_app().await] {
+        let metric_name = format!("group_metric_{}", Uuid::new_v4());
+        let now = Utc::now();
+        let points = [
+            json!({
+                "name": metric_name,
+                "labels": {"node": "node-a", "region": "us"},
+                "value": 1.0,
+                "timestamp": now
+            }),
+            json!({
+                "name": metric_name,
+                "labels": {"node": "node-a", "region": "us"},
+                "value": 2.0,
+                "timestamp": now
+            }),
+            json!({
+                "name": metric_name,
+                "labels": {"node": "node-a", "region": "eu"},
+                "value": 3.0,
+                "timestamp": now
+            }),
+            json!({
+                "name": metric_name,
+                "labels": {"node": "node-b", "region": "us"},
+                "value": 4.0,
+                "timestamp": now
+            }),
+        ];
+
+        for point in points {
+            let write_response = app
+                .clone()
+                .oneshot(authed_request(
+                    "POST",
+                    "/v1/metrics/batch",
+                    &token,
+                    Some(json!({ "metrics": [point] })),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(write_response.status(), StatusCode::OK);
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let query_data = metrics_query_response_json(
+            app,
+            "GET",
+            &format!(
+                "/api/public/metrics/query?name={metric_name}&step=1m&agg=count&group_by=node,region"
+            ),
+            &token,
+            None,
+        )
+        .await;
+
+        assert_eq!(query_data["meta"]["series_count"].as_u64(), Some(3));
+        assert_eq!(query_data["data"].as_array().unwrap().len(), 3);
+
+        let mut series = std::collections::BTreeMap::new();
+        for item in query_data["data"].as_array().unwrap() {
+            let node = item["labels"]["node"].as_str().unwrap().to_string();
+            let region = item["labels"]["region"].as_str().unwrap().to_string();
+            let value = item["values"][0]["value"].as_f64().unwrap();
+            series.insert((node, region), value);
+        }
+
+        assert_eq!(
+            series.get(&("node-a".to_string(), "us".to_string())),
+            Some(&2.0)
+        );
+        assert_eq!(
+            series.get(&("node-a".to_string(), "eu".to_string())),
+            Some(&1.0)
+        );
+        assert_eq!(
+            series.get(&("node-b".to_string(), "us".to_string())),
+            Some(&1.0)
+        );
+    }
+}
+
 #[tokio::test]
 async fn in_memory_storage_integration_test() {
     let (app, token) = setup_mock_app().await;

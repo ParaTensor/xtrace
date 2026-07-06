@@ -391,10 +391,8 @@ pub(crate) fn enrich_batch(batch: &mut BatchIngestRequest) {
         if let Some(end) = obs.endTime {
             max_end = Some(max_end.map_or(end, |cur| cur.max(end)));
         }
-        if obs.parentObservationId.is_none() {
-            if root_name.is_none() {
-                root_name = obs.name.clone();
-            }
+        if obs.parentObservationId.is_none() && root_name.is_none() {
+            root_name = obs.name.clone();
         }
     }
 
