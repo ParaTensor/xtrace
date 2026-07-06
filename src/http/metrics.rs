@@ -22,6 +22,21 @@ use crate::{
     state::AppState,
 };
 
+type MetricBucketPoints = BTreeMap<DateTime<Utc>, Vec<(f64, DateTime<Utc>)>>;
+type MetricGroupBucket = (JsonValue, MetricBucketPoints);
+type DailyTraceGroup = (
+    Vec<crate::state::TraceRow>,
+    Vec<crate::state::ObservationRow>,
+);
+type DailyModelGroup = (
+    i64,
+    i64,
+    i64,
+    std::collections::HashSet<uuid::Uuid>,
+    i64,
+    f64,
+);
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct MetricsBatchRequest {
     pub metrics: Vec<MetricPointIngest>,
@@ -74,23 +89,6 @@ struct MetricsQueryResponse {
     meta: MetricsQueryMeta,
 }
 
-type MetricSeriesGroups = BTreeMap<
-    String,
-    (
-        JsonValue,
-        BTreeMap<DateTime<Utc>, Vec<(f64, DateTime<Utc>)>>,
-    ),
->;
-
-type ModelGroupStats = (
-    i64,
-    i64,
-    i64,
-    std::collections::HashSet<uuid::Uuid>,
-    i64,
-    f64,
-);
-
 pub(crate) async fn post_metrics_batch(
     State(state): State<AppState>,
     Json(payload): Json<MetricsBatchRequest>,
@@ -133,13 +131,72 @@ fn parse_agg(agg: Option<&str>) -> Result<&'static str, ApiError> {
         "min" => Ok("min"),
         "sum" => Ok("sum"),
         "last" => Ok("last"),
+        "count" => Ok("count"),
         "p50" => Ok("p50"),
         "p90" => Ok("p90"),
         "p99" => Ok("p99"),
         _ => Err(ApiError::BadRequest(
-            "invalid agg, must be one of: avg, max, min, sum, last, p50, p90, p99".to_string(),
+            "invalid agg, must be one of: avg, max, min, sum, last, count, p50, p90, p99"
+                .to_string(),
         )),
     }
+}
+
+fn parse_group_by_keys(group_by: Option<&str>) -> Vec<String> {
+    group_by
+        .into_iter()
+        .flat_map(|group_by| group_by.split(','))
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn sql_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn labels_and_group_key_from_json(
+    labels: &JsonValue,
+    group_by_keys: &[String],
+) -> (JsonValue, String) {
+    if group_by_keys.is_empty() {
+        return (labels.clone(), labels.to_string());
+    }
+
+    let mut pairs = Vec::with_capacity(group_by_keys.len());
+    let mut map = serde_json::Map::with_capacity(group_by_keys.len());
+    let source = labels.as_object();
+    for key in group_by_keys {
+        let value = source
+            .and_then(|m| m.get(key))
+            .cloned()
+            .unwrap_or(JsonValue::Null);
+        pairs.push((key.clone(), value.clone()));
+        map.insert(key.clone(), value);
+    }
+
+    let labels_json = JsonValue::Object(map);
+    let key = serde_json::to_string(&pairs).unwrap_or_else(|_| labels_json.to_string());
+    (labels_json, key)
+}
+
+fn group_key_from_json(labels: &JsonValue, group_by_keys: &[String]) -> String {
+    if group_by_keys.is_empty() {
+        return labels.to_string();
+    }
+
+    let mut pairs = Vec::with_capacity(group_by_keys.len());
+    let source = labels.as_object();
+    for key in group_by_keys {
+        let value = source
+            .and_then(|m| m.get(key))
+            .cloned()
+            .unwrap_or(JsonValue::Null);
+        pairs.push((key.clone(), value));
+    }
+
+    serde_json::to_string(&pairs).unwrap_or_else(|_| labels.to_string())
 }
 
 pub(crate) async fn get_metrics_names(
@@ -202,6 +259,7 @@ pub(crate) async fn get_metrics_query(
         ),
         _ => None,
     };
+    let group_by_keys = parse_group_by_keys(q.group_by.as_deref());
 
     let project_id = state.default_project_id.as_ref();
 
@@ -218,6 +276,7 @@ pub(crate) async fn get_metrics_query(
                 "min" => "MIN(value)::DOUBLE PRECISION",
                 "sum" => "SUM(value)::DOUBLE PRECISION",
                 "last" => "(ARRAY_AGG(value ORDER BY timestamp DESC))[1]::DOUBLE PRECISION",
+                "count" => "COUNT(value)::DOUBLE PRECISION",
                 "p50" => "(percentile_cont(0.5) WITHIN GROUP (ORDER BY value))::DOUBLE PRECISION",
                 "p90" => "(percentile_cont(0.9) WITHIN GROUP (ORDER BY value))::DOUBLE PRECISION",
                 "p99" => "(percentile_cont(0.99) WITHIN GROUP (ORDER BY value))::DOUBLE PRECISION",
@@ -250,22 +309,29 @@ pub(crate) async fn get_metrics_query(
             }
 
             builder.push("),\naggregated AS (\n  SELECT\n    bucket_ts,\n    ");
-            if let Some(ref group_key) = q.group_by {
-                builder.push("jsonb_build_object(");
-                builder.push_bind(group_key.clone());
-                builder.push(", labels ->> ");
-                builder.push_bind(group_key.clone());
-                builder.push(") AS labels,\n    ");
-            } else {
+            if group_by_keys.is_empty() {
                 builder.push("labels,\n    ");
+            } else {
+                builder.push("jsonb_build_object(");
+                for (idx, group_key) in group_by_keys.iter().enumerate() {
+                    if idx > 0 {
+                        builder.push(", ");
+                    }
+                    builder.push(sql_string_literal(group_key));
+                    builder.push(", labels ->> ");
+                    builder.push(sql_string_literal(group_key));
+                }
+                builder.push(") AS labels,\n    ");
             }
             builder.push(agg_expr);
-            builder.push(" AS value\n  FROM filtered\n  GROUP BY bucket_ts, ");
-            if let Some(ref group_key) = q.group_by {
-                builder.push("labels ->> ");
-                builder.push_bind(group_key.clone());
+            builder.push(" AS value\n  FROM filtered\n  GROUP BY bucket_ts");
+            if group_by_keys.is_empty() {
+                builder.push(", labels");
             } else {
-                builder.push("labels");
+                for group_key in &group_by_keys {
+                    builder.push(", labels ->> ");
+                    builder.push(sql_string_literal(group_key));
+                }
             }
             builder.push(
                 "\n),\nranked AS (\n  SELECT\n    bucket_ts,\n    labels,\n    value,\n    ROW_NUMBER() OVER (PARTITION BY labels ORDER BY bucket_ts ASC) AS point_rank,\n    DENSE_RANK() OVER (ORDER BY labels) AS series_rank\n  FROM aggregated\n)\nSELECT\n  bucket_ts,\n  labels,\n  value,\n  point_rank,\n  series_rank\nFROM ranked\nWHERE point_rank <= ",
@@ -303,7 +369,7 @@ pub(crate) async fn get_metrics_query(
                     _ => {}
                 }
 
-                let key = r.labels.to_string();
+                let key = group_key_from_json(&r.labels, &group_by_keys);
                 let entry = series_map.entry(key).or_insert_with(|| MetricsSeries {
                     labels: r.labels.clone(),
                     values: Vec::new(),
@@ -321,7 +387,7 @@ pub(crate) async fn get_metrics_query(
                 .lock()
                 .map_err(|e| ApiError::Internal(format!("Mutex lock error: {e}")))?;
 
-            let mut grouped: MetricSeriesGroups = BTreeMap::new();
+            let mut grouped: BTreeMap<String, MetricGroupBucket> = BTreeMap::new();
 
             for m in metrics_guard.iter() {
                 if m.project_id != project_id
@@ -343,16 +409,7 @@ pub(crate) async fn get_metrics_query(
                 let bucket_ts =
                     DateTime::<Utc>::from_timestamp(bucket_seconds, 0).unwrap_or(m.timestamp);
 
-                let final_labels = if let Some(ref group_key) = q.group_by {
-                    let mut map = serde_json::Map::new();
-                    let val = m.labels.get(group_key).cloned().unwrap_or(JsonValue::Null);
-                    map.insert(group_key.clone(), val);
-                    JsonValue::Object(map)
-                } else {
-                    m.labels.clone()
-                };
-
-                let key = final_labels.to_string();
+                let (final_labels, key) = labels_and_group_key_from_json(&m.labels, &group_by_keys);
                 let entry = grouped
                     .entry(key)
                     .or_insert_with(|| (final_labels, BTreeMap::new()));
@@ -394,6 +451,7 @@ pub(crate) async fn get_metrics_query(
                             pts.sort_by_key(|p| p.1);
                             pts.last().map(|p| p.0).unwrap_or(0.0)
                         }
+                        "count" => pts.len() as f64,
                         "p50" => {
                             let vals: Vec<f64> = pts.iter().map(|p| p.0).collect();
                             percentile(&vals, 0.5)
@@ -637,13 +695,7 @@ pub(crate) async fn get_metrics_daily(
                     .push(obs.clone());
             }
 
-            let mut daily_groups: BTreeMap<
-                NaiveDate,
-                (
-                    Vec<crate::state::TraceRow>,
-                    Vec<crate::state::ObservationRow>,
-                ),
-            > = BTreeMap::new();
+            let mut daily_groups: BTreeMap<NaiveDate, DailyTraceGroup> = BTreeMap::new();
             for t in filtered_traces {
                 let day = t.timestamp.date_naive();
                 let entry = daily_groups.entry(day).or_default();
@@ -659,7 +711,7 @@ pub(crate) async fn get_metrics_daily(
                 let count_observations = obs.len() as i64;
                 let total_cost: f64 = traces.iter().map(|t| t.total_cost.unwrap_or(0.0)).sum();
 
-                let mut model_groups: HashMap<String, ModelGroupStats> = HashMap::new();
+                let mut model_groups: HashMap<String, DailyModelGroup> = HashMap::new();
                 for o in obs.iter().filter(|o| o.r#type == "GENERATION") {
                     let model = o
                         .model
