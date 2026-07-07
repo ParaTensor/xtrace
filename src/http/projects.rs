@@ -3,7 +3,10 @@ use chrono::Utc;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 
-use crate::state::AppState;
+use crate::{
+    http::auth_context::Authenticated,
+    state::AppState,
+};
 
 #[derive(Debug, Serialize)]
 struct ProjectsResponse {
@@ -21,9 +24,9 @@ struct Project {
     metadata: Option<JsonValue>,
 }
 
-pub(crate) async fn get_projects(State(state): State<AppState>) -> impl IntoResponse {
+pub(crate) async fn get_projects(_state: State<AppState>, auth: Authenticated) -> impl IntoResponse {
     let now = Utc::now().to_rfc3339();
-    let project_id = state.default_project_id.as_ref().to_string();
+    let project_id = auth.project_id().to_string();
     (
         StatusCode::OK,
         Json(ProjectsResponse {

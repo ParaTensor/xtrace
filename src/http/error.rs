@@ -9,6 +9,8 @@ pub enum ApiError {
     BadRequest(String),
     #[error("not found")]
     NotFound,
+    #[error("forbidden: {0}")]
+    Forbidden(String),
     #[error("too many requests")]
     TooManyRequests,
     #[error("service unavailable")]
@@ -34,6 +36,7 @@ impl IntoResponse for ApiError {
         let (status, code, msg) = match self {
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, "BAD_REQUEST", m),
             ApiError::NotFound => (StatusCode::NOT_FOUND, "NOT_FOUND", "Not Found".to_string()),
+            ApiError::Forbidden(m) => (StatusCode::FORBIDDEN, "FORBIDDEN", m),
             ApiError::TooManyRequests => (
                 StatusCode::TOO_MANY_REQUESTS,
                 "TOO_MANY_REQUESTS",

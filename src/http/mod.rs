@@ -1,4 +1,5 @@
 pub(crate) mod auth;
+pub(crate) mod auth_context;
 pub(crate) mod common;
 pub(crate) mod error;
 pub(crate) mod media;

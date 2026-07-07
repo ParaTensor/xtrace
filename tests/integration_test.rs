@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 use sqlx::postgres::PgPoolOptions;
 use tower::ServiceExt;
 use uuid::Uuid;
-use xtrace::test_app::{setup_mock_router, setup_test_router};
+use xtrace::test_app::{setup_mock_router, setup_mock_router_with_project_tokens, setup_mock_router_with_tokens, setup_test_router};
 
 async fn setup_app() -> (axum::Router, String) {
     let database_url =
@@ -885,4 +885,88 @@ async fn otlp_histogram_emits_count_and_sum() {
     );
     assert_eq!(sum_data["data"][0]["labels"]["service.name"], "hist-svc");
     assert_eq!(sum_data["data"][0]["labels"]["route"], "/search");
+}
+
+#[tokio::test]
+async fn read_only_token_cannot_write_metrics() {
+    let app = setup_mock_router_with_tokens("write-token", Some("read-token")).await;
+    let response = app
+        .oneshot(authed_request(
+            "POST",
+            "/v1/metrics/batch",
+            "read-token",
+            Some(json!({
+                "metrics": [{
+                    "name": "blocked_metric",
+                    "labels": {"node": "n1"},
+                    "value": 1.0,
+                    "timestamp": Utc::now()
+                }]
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn multi_tenant_project_tokens_are_isolated() {
+    let app = xtrace::test_app::setup_mock_router_with_project_tokens(
+        "team-a:write-a:read-a,team-b:write-b",
+    )
+    .await;
+
+    let write_response = app
+        .clone()
+        .oneshot(authed_request(
+            "POST",
+            "/v1/metrics/batch",
+            "write-a",
+            Some(json!({
+                "metrics": [{
+                    "name": "tenant_metric",
+                    "labels": {"tenant": "a"},
+                    "value": 9.0,
+                    "timestamp": Utc::now()
+                }]
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(write_response.status(), StatusCode::OK);
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let team_b_query = app
+        .clone()
+        .oneshot(authed_request(
+            "GET",
+            "/api/public/metrics/query?name=tenant_metric&step=1m&agg=avg",
+            "write-b",
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(team_b_query.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(team_b_query.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let data: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(data["meta"]["series_count"].as_u64(), Some(0));
+
+    let team_a_query = app
+        .oneshot(authed_request(
+            "GET",
+            "/api/public/metrics/query?name=tenant_metric&step=1m&agg=avg",
+            "write-a",
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(team_a_query.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(team_a_query.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let data: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(data["meta"]["series_count"].as_u64(), Some(1));
 }

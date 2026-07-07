@@ -10,12 +10,12 @@ use serde_json::Value as JsonValue;
 use sqlx::QueryBuilder;
 use std::{
     collections::{BTreeMap, HashMap},
-    sync::Arc,
 };
 use tokio::{sync::mpsc, time::Duration};
 
 use crate::{
     http::{
+        auth_context::Authenticated,
         common::{ApiResponse, PageMeta, PagedData},
         error::ApiError,
     },
@@ -38,7 +38,13 @@ type DailyModelGroup = (
 );
 
 #[derive(Debug, Deserialize)]
+pub(crate) struct MetricsBatchIngestBody {
+    pub metrics: Vec<MetricPointIngest>,
+}
+
+#[derive(Debug, Deserialize)]
 pub(crate) struct MetricsBatchRequest {
+    pub project_id: String,
     pub metrics: Vec<MetricPointIngest>,
 }
 
@@ -91,8 +97,10 @@ struct MetricsQueryResponse {
 
 pub(crate) async fn post_metrics_batch(
     State(state): State<AppState>,
-    Json(payload): Json<MetricsBatchRequest>,
+    auth: Authenticated,
+    Json(payload): Json<MetricsBatchIngestBody>,
 ) -> Result<impl IntoResponse, ApiError> {
+    auth.require_write()?;
     let metrics = state.label_governance.apply_batch(payload.metrics)?;
     if metrics.is_empty() {
         return Ok((
@@ -104,7 +112,10 @@ pub(crate) async fn post_metrics_batch(
             }),
         ));
     }
-    match state.metrics_tx.try_send(MetricsBatchRequest { metrics }) {
+    match state.metrics_tx.try_send(MetricsBatchRequest {
+        project_id: auth.project_id().to_string(),
+        metrics,
+    }) {
         Ok(()) => Ok((
             StatusCode::OK,
             Json(ApiResponse::<serde_json::Value> {
@@ -212,8 +223,9 @@ fn group_key_from_json(labels: &JsonValue, group_by_keys: &[String]) -> String {
 
 pub(crate) async fn get_metrics_names(
     State(state): State<AppState>,
+    auth: Authenticated,
 ) -> Result<impl IntoResponse, ApiError> {
-    let project_id = state.default_project_id.as_ref();
+    let project_id = auth.project_id();
 
     let names: Vec<String> = match &state.db {
         crate::state::DatabaseConnection::Postgres(pool) => {
@@ -250,6 +262,7 @@ ORDER BY name
 
 pub(crate) async fn get_metrics_query(
     State(state): State<AppState>,
+    auth: Authenticated,
     Query(q): Query<MetricsQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     let now = Utc::now();
@@ -272,7 +285,7 @@ pub(crate) async fn get_metrics_query(
     };
     let group_by_keys = parse_group_by_keys(q.group_by.as_deref());
 
-    let project_id = state.default_project_id.as_ref();
+    let project_id = auth.project_id();
     let max_series = state.metrics_query_max_series as i64;
     let max_points = state.metrics_query_max_points_per_series as i64;
 
@@ -557,6 +570,7 @@ struct MetricsDailyItem {
 
 pub(crate) async fn get_metrics_daily(
     State(state): State<AppState>,
+    auth: Authenticated,
     Query(q): Query<MetricsDailyQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     let page = q.page.unwrap_or(1).max(1);
@@ -569,7 +583,7 @@ pub(crate) async fn get_metrics_daily(
         .from_timestamp
         .unwrap_or_else(|| to_ts - chrono::Duration::days(30));
 
-    let project_id = state.default_project_id.as_ref();
+    let project_id = auth.project_id();
 
     let (total_items, total_pages, items) = match &state.db {
         crate::state::DatabaseConnection::Postgres(pool) => {
@@ -823,7 +837,6 @@ fn labels_to_json(labels: HashMap<String, String>) -> JsonValue {
 
 pub(crate) async fn metrics_worker(
     db: crate::state::DatabaseConnection,
-    default_project_id: Arc<str>,
     mut rx: mpsc::Receiver<MetricsBatchRequest>,
 ) {
     const MAX_BATCHES: usize = 200;
@@ -848,7 +861,7 @@ pub(crate) async fn metrics_worker(
             }
         }
 
-        if let Err(err) = write_metrics_batches(&db, default_project_id.as_ref(), batches).await {
+        if let Err(err) = write_metrics_batches(&db, batches).await {
             tracing::error!(error = ?err, "failed to write metrics batch");
         }
     }
@@ -856,14 +869,9 @@ pub(crate) async fn metrics_worker(
 
 async fn write_metrics_batches(
     db: &crate::state::DatabaseConnection,
-    default_project_id: &str,
     payloads: Vec<MetricsBatchRequest>,
 ) -> Result<(), anyhow::Error> {
-    let mut points: Vec<MetricPointIngest> = Vec::new();
-    for p in payloads {
-        points.extend(p.metrics);
-    }
-    if points.is_empty() {
+    if payloads.is_empty() {
         return Ok(());
     }
 
@@ -874,14 +882,22 @@ async fn write_metrics_batches(
             let mut builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
                 "INSERT INTO metrics (project_id, environment, name, labels, value, timestamp) ",
             );
-            builder.push_values(points, |mut b, m| {
-                b.push_bind(default_project_id.to_string())
-                    .push_bind("default".to_string())
-                    .push_bind(m.name)
-                    .push_bind(labels_to_json(m.labels))
-                    .push_bind(m.value)
-                    .push_bind(m.timestamp);
-            });
+            builder.push_values(
+                payloads.iter().flat_map(|batch| {
+                    batch
+                        .metrics
+                        .iter()
+                        .map(move |m| (batch.project_id.as_str(), m))
+                }),
+                |mut b, (project_id, m)| {
+                    b.push_bind(project_id.to_string())
+                        .push_bind("default".to_string())
+                        .push_bind(m.name.clone())
+                        .push_bind(labels_to_json(m.labels.clone()))
+                        .push_bind(m.value)
+                        .push_bind(m.timestamp);
+                },
+            );
 
             builder.build().execute(&mut *tx).await?;
             tx.commit().await?;
@@ -892,16 +908,18 @@ async fn write_metrics_batches(
                 .lock()
                 .map_err(|e| anyhow::anyhow!("Mutex lock error: {e}"))?;
             let now = Utc::now();
-            for m in points {
-                metrics_guard.push(crate::state::MetricRow {
-                    project_id: default_project_id.to_string(),
-                    environment: "default".to_string(),
-                    name: m.name,
-                    labels: labels_to_json(m.labels),
-                    value: m.value,
-                    timestamp: m.timestamp,
-                    created_at: now,
-                });
+            for batch in payloads {
+                for m in batch.metrics {
+                    metrics_guard.push(crate::state::MetricRow {
+                        project_id: batch.project_id.clone(),
+                        environment: "default".to_string(),
+                        name: m.name,
+                        labels: labels_to_json(m.labels),
+                        value: m.value,
+                        timestamp: m.timestamp,
+                        created_at: now,
+                    });
+                }
             }
         }
     }
@@ -957,12 +975,13 @@ struct FilterSpec {
 
 pub(crate) async fn get_metrics_overview(
     State(state): State<AppState>,
+    auth: Authenticated,
     Query(q): Query<MetricsOverviewQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     let config: MetricsOverviewQueryConfig =
         serde_json::from_str(&q.query).map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
-    let project_id = state.default_project_id.to_string();
+    let project_id = auth.project_id().to_string();
     let from_ts = config
         .from_timestamp
         .unwrap_or_else(|| Utc::now() - chrono::Duration::days(365));

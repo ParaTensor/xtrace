@@ -124,6 +124,35 @@ async fn main() -> anyhow::Result<()> {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(1000),
+        api_read_bearer_token: std::env::var("API_READ_BEARER_TOKEN").ok(),
+        project_tokens: std::env::var("XTRACE_PROJECT_TOKENS").ok(),
+        project_basic_auth: std::env::var("XTRACE_PROJECT_BASIC_AUTH").ok(),
+        retention: xtrace::RetentionConfig {
+            metrics_retention_days: std::env::var("METRICS_RETENTION_DAYS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            traces_retention_days: std::env::var("TRACES_RETENTION_DAYS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            metrics_downsample_after_days: std::env::var("METRICS_DOWNSAMPLE_AFTER_DAYS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            interval_hours: std::env::var("RETENTION_INTERVAL_HOURS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(24),
+            memory_max_metrics: std::env::var("XTRACE_MEMORY_MAX_METRICS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            memory_max_traces: std::env::var("XTRACE_MEMORY_MAX_TRACES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+        },
     };
 
     run_server(config).await

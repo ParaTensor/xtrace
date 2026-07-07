@@ -13,9 +13,11 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::{
+    http::auth_context::AuthRegistry,
     http::metrics::MetricsBatchRequest,
-    ingest::batch::BatchIngestRequest,
+    ingest::batch::IngestEnvelope,
     metrics::label_governance::{LabelGovernance, LabelGovernanceConfig},
+    retention::{RetentionConfig, RetentionStats},
 };
 
 pub type KeyedRateLimiter =
@@ -139,6 +141,10 @@ pub struct ServerConfig {
     pub metrics_query_max_series: usize,
     /// Max data points per series returned by metrics query.
     pub metrics_query_max_points_per_series: usize,
+    pub api_read_bearer_token: Option<String>,
+    pub project_tokens: Option<String>,
+    pub project_basic_auth: Option<String>,
+    pub retention: RetentionConfig,
 }
 
 #[derive(Clone)]
@@ -148,7 +154,8 @@ pub struct AppState {
     pub langfuse_public_key: Option<Arc<str>>,
     pub langfuse_secret_key: Option<Arc<str>>,
     pub default_project_id: Arc<str>,
-    pub(crate) ingest_tx: mpsc::Sender<BatchIngestRequest>,
+    pub auth_registry: AuthRegistry,
+    pub(crate) ingest_tx: mpsc::Sender<IngestEnvelope>,
     pub(crate) metrics_tx: mpsc::Sender<MetricsBatchRequest>,
     pub query_limiter: Arc<KeyedRateLimiter>,
     pub rate_limit_stats: Arc<RateLimitStats>,
@@ -162,6 +169,7 @@ pub struct AppState {
     pub label_governance: LabelGovernance,
     pub metrics_query_max_series: usize,
     pub metrics_query_max_points_per_series: usize,
+    pub retention_stats: Arc<RetentionStats>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, sqlx::FromRow)]

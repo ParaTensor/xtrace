@@ -90,3 +90,7 @@ pub(crate) async fn get_metrics_label_governance_stats(
 
     (StatusCode::OK, Json(body))
 }
+
+pub(crate) async fn get_retention_stats(State(state): State<AppState>) -> impl IntoResponse {
+    (StatusCode::OK, Json(state.retention_stats.snapshot()))
+}

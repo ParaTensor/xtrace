@@ -12,15 +12,20 @@ use tower_http::trace::TraceLayer;
 use crate::http::common::{healthz, readyz};
 use crate::http::{
     auth::{auth, rate_limit},
+    auth_context::AuthRegistry,
     media,
     metrics::{self, metrics_worker, post_metrics_batch, MetricsBatchRequest},
-    ops::{get_ingest_stats, get_metrics_label_governance_stats, get_rate_limit_stats},
+    ops::{
+        get_ingest_stats, get_metrics_label_governance_stats, get_rate_limit_stats,
+        get_retention_stats,
+    },
     projects::get_projects,
     traces,
 };
-use crate::ingest::batch::{ingest_worker, post_batch, BatchIngestRequest};
+use crate::ingest::batch::{ingest_worker, post_batch, IngestEnvelope};
 use crate::ingest::otlp;
 use crate::metrics::label_governance::LabelGovernance;
+use crate::retention::retention_worker;
 use crate::state::{AppState, IngestStats, RateLimitStats, ServerConfig};
 
 /// Build the Axum router (used by the server and integration tests).
@@ -71,6 +76,7 @@ pub fn build_router(state: AppState, max_body: usize) -> Router {
             "/api/internal/metrics_label_governance_stats",
             get(get_metrics_label_governance_stats),
         )
+        .route("/api/internal/retention_stats", get(get_retention_stats))
         .merge(media_content_routes)
         .merge(protected_routes)
         .layer(DefaultBodyLimit::max(max_body))
@@ -101,7 +107,7 @@ pub async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
         crate::state::DatabaseConnection::Postgres(pool)
     };
 
-    let (ingest_tx, ingest_rx) = mpsc::channel::<BatchIngestRequest>(1000);
+    let (ingest_tx, ingest_rx) = mpsc::channel::<IngestEnvelope>(1000);
     let (metrics_tx, metrics_rx) = mpsc::channel::<MetricsBatchRequest>(5000);
 
     let qps = config.rate_limit_qps;
@@ -109,15 +115,26 @@ pub async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
     let query_limiter = AppState::build_limiter(qps, burst);
     let rate_limit_stats = Arc::new(RateLimitStats::new());
     let ingest_stats = Arc::new(IngestStats::new());
+    let retention_stats = Arc::new(crate::retention::RetentionStats::default());
+    let auth_registry = AuthRegistry::from_config(
+        config.default_project_id.clone(),
+        config.api_bearer_token.clone(),
+        config.api_read_bearer_token.clone(),
+        config.langfuse_public_key.clone(),
+        config.langfuse_secret_key.clone(),
+        config.project_tokens.as_deref(),
+        config.project_basic_auth.as_deref(),
+    );
 
     std::fs::create_dir_all(&config.media_dir)?;
 
     let state = AppState {
-        db: db_conn,
+        db: db_conn.clone(),
         api_bearer_token: Arc::from(config.api_bearer_token),
         langfuse_public_key: config.langfuse_public_key.map(Arc::from),
         langfuse_secret_key: config.langfuse_secret_key.map(Arc::from),
-        default_project_id: Arc::from(config.default_project_id),
+        default_project_id: auth_registry.default_project_id.clone(),
+        auth_registry,
         ingest_tx,
         metrics_tx,
         query_limiter,
@@ -132,20 +149,20 @@ pub async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
         label_governance: LabelGovernance::new(config.label_governance),
         metrics_query_max_series: config.metrics_query_max_series,
         metrics_query_max_points_per_series: config.metrics_query_max_points_per_series,
+        retention_stats: retention_stats.clone(),
     };
 
-    tokio::spawn(ingest_worker(
-        state.db.clone(),
-        state.default_project_id.clone(),
-        ingest_rx,
-        ingest_stats,
-    ));
+    tokio::spawn(ingest_worker(state.db.clone(), ingest_rx, ingest_stats));
 
-    tokio::spawn(metrics_worker(
-        state.db.clone(),
-        state.default_project_id.clone(),
-        metrics_rx,
-    ));
+    tokio::spawn(metrics_worker(state.db.clone(), metrics_rx));
+
+    if config.retention.enabled() {
+        tokio::spawn(retention_worker(
+            state.db.clone(),
+            config.retention.clone(),
+            retention_stats,
+        ));
+    }
 
     let addr: SocketAddr = config.bind_addr.parse()?;
     tracing::info!(

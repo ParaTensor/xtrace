@@ -26,10 +26,11 @@ use uuid::Uuid;
 
 use crate::{
     http::{
+        auth_context::Authenticated,
         error::ApiError,
         metrics::{MetricPointIngest, MetricsBatchRequest},
     },
-    ingest::batch::{BatchIngestRequest, ObservationIngest, TraceIngest},
+    ingest::batch::{BatchIngestRequest, IngestEnvelope, ObservationIngest, TraceIngest},
     state::AppState,
 };
 
@@ -471,10 +472,10 @@ fn ungzip_if_needed(headers: &HeaderMap, body: Bytes) -> Result<Vec<u8>, ApiErro
 }
 
 fn map_otel_to_batches(
-    state: &AppState,
+    project_id: &str,
     payload: OtelExportTraceServiceRequest,
 ) -> Result<Vec<BatchIngestRequest>, ApiError> {
-    let default_project_id = state.default_project_id.as_ref().to_string();
+    let default_project_id = project_id.to_string();
     let mut per_trace: std::collections::BTreeMap<Uuid, Vec<ObservationIngest>> =
         std::collections::BTreeMap::new();
     let mut trace_first_ts: std::collections::BTreeMap<Uuid, DateTime<Utc>> =
@@ -1006,7 +1007,10 @@ fn json_metrics_to_batch(payload: OtelExportMetricsServiceRequest) -> MetricsBat
         }
     }
 
-    MetricsBatchRequest { metrics: points }
+    MetricsBatchRequest {
+        project_id: String::new(),
+        metrics: points,
+    }
 }
 
 fn pb_any_value_to_json(v: &PbAnyValueMsg) -> JsonValue {
@@ -1192,18 +1196,23 @@ fn pb_otel_metrics_to_batch(payload: PbExportMetricsServiceRequest) -> MetricsBa
         }
     }
 
-    MetricsBatchRequest { metrics: points }
+    MetricsBatchRequest {
+        project_id: String::new(),
+        metrics: points,
+    }
 }
 
 pub(crate) async fn post_otel_metrics(
     State(state): State<AppState>,
+    auth: Authenticated,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, ApiError> {
+    auth.require_write()?;
     let raw = ungzip_if_needed(&headers, body)?;
     let ct = content_type(&headers).unwrap_or_else(|| "application/json".to_string());
 
-    let batch = if ct == "application/json" {
+    let mut batch = if ct == "application/json" {
         let otel: OtelExportMetricsServiceRequest = serde_json::from_slice(&raw)
             .map_err(|e| ApiError::BadRequest(format!("invalid json: {e}")))?;
         json_otel_metrics_to_batch(otel)
@@ -1217,6 +1226,9 @@ pub(crate) async fn post_otel_metrics(
         )));
     };
 
+    batch.project_id = auth.project_id().to_string();
+    batch.metrics = state.label_governance.apply_batch(batch.metrics)?;
+
     if !batch.metrics.is_empty() {
         state.metrics_tx.try_send(batch).map_err(|e| match e {
             mpsc::error::TrySendError::Full(_) => ApiError::TooManyRequests,
@@ -1229,9 +1241,11 @@ pub(crate) async fn post_otel_metrics(
 
 pub(crate) async fn post_otel_traces(
     State(state): State<AppState>,
+    auth: Authenticated,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, ApiError> {
+    auth.require_write()?;
     let raw = ungzip_if_needed(&headers, body)?;
     let ct = content_type(&headers).unwrap_or_else(|| "application/json".to_string());
 
@@ -1248,12 +1262,18 @@ pub(crate) async fn post_otel_traces(
         )));
     };
 
-    let batches = map_otel_to_batches(&state, otel)?;
+    let batches = map_otel_to_batches(auth.project_id(), otel)?;
     for batch in batches {
-        state.ingest_tx.try_send(batch).map_err(|e| match e {
-            mpsc::error::TrySendError::Full(_) => ApiError::TooManyRequests,
-            mpsc::error::TrySendError::Closed(_) => ApiError::ServiceUnavailable,
-        })?;
+        state
+            .ingest_tx
+            .try_send(IngestEnvelope {
+                project_id: auth.project_id().to_string(),
+                batch,
+            })
+            .map_err(|e| match e {
+                mpsc::error::TrySendError::Full(_) => ApiError::TooManyRequests,
+                mpsc::error::TrySendError::Closed(_) => ApiError::ServiceUnavailable,
+            })?;
     }
 
     Ok((StatusCode::OK, Json(serde_json::json!({}))))

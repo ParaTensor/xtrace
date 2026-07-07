@@ -11,7 +11,7 @@ use tokio::{sync::mpsc, time::Duration};
 use uuid::Uuid;
 
 use crate::{
-    http::{common::ApiResponse, error::ApiError},
+    http::{auth_context::Authenticated, common::ApiResponse, error::ApiError},
     state::{AppState, IngestStats},
 };
 
@@ -21,6 +21,12 @@ pub(crate) struct BatchIngestRequest {
     pub trace: Option<TraceIngest>,
     #[serde(default)]
     pub observations: Vec<ObservationIngest>,
+}
+
+#[derive(Debug)]
+pub(crate) struct IngestEnvelope {
+    pub project_id: String,
+    pub batch: BatchIngestRequest,
 }
 
 #[derive(Debug, Deserialize)]
@@ -62,7 +68,8 @@ pub(crate) struct TraceIngest {
     #[serde(default)]
     pub totalCost: Option<f64>,
 
-    #[serde(default)]
+    #[serde(default, alias = "projectId")]
+    #[allow(dead_code)]
     pub projectId: Option<String>,
 }
 
@@ -148,7 +155,8 @@ pub(crate) struct ObservationIngest {
     #[serde(default)]
     pub environment: Option<String>,
 
-    #[serde(default)]
+    #[serde(default, alias = "projectId")]
+    #[allow(dead_code)]
     pub projectId: Option<String>,
 }
 
@@ -212,9 +220,15 @@ struct ResolvedObservation {
 
 pub(crate) async fn post_batch(
     State(state): State<AppState>,
+    auth: Authenticated,
     Json(payload): Json<BatchIngestRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    match state.ingest_tx.try_send(payload) {
+    auth.require_write()?;
+    let envelope = IngestEnvelope {
+        project_id: auth.project_id().to_string(),
+        batch: payload,
+    };
+    match state.ingest_tx.try_send(envelope) {
         Ok(()) => {
             state.ingest_stats.record_enqueued(1);
             Ok((
@@ -236,19 +250,18 @@ pub(crate) async fn post_batch(
 
 pub(crate) async fn ingest_worker(
     db: crate::state::DatabaseConnection,
-    default_project_id: Arc<str>,
-    mut rx: mpsc::Receiver<BatchIngestRequest>,
+    mut rx: mpsc::Receiver<IngestEnvelope>,
     stats: Arc<IngestStats>,
 ) {
     const MAX_BATCHES: usize = 200;
     let window = Duration::from_millis(50);
 
     while let Some(first) = rx.recv().await {
-        let mut batches = Vec::with_capacity(MAX_BATCHES);
-        batches.push(first);
+        let mut envelopes = Vec::with_capacity(MAX_BATCHES);
+        envelopes.push(first);
 
         let start = tokio::time::Instant::now();
-        while batches.len() < MAX_BATCHES {
+        while envelopes.len() < MAX_BATCHES {
             let elapsed = start.elapsed();
             let remaining = match window.checked_sub(elapsed) {
                 Some(r) if !r.is_zero() => r,
@@ -256,25 +269,25 @@ pub(crate) async fn ingest_worker(
             };
 
             match tokio::time::timeout(remaining, rx.recv()).await {
-                Ok(Some(p)) => batches.push(p),
+                Ok(Some(p)) => envelopes.push(p),
                 Ok(None) => break,
                 Err(_) => break,
             }
         }
 
-        let item_count = batches
+        let item_count = envelopes
             .iter()
-            .map(|b| b.trace.as_ref().map(|_| 1).unwrap_or(0) + b.observations.len())
+            .map(|e| {
+                e.batch.trace.as_ref().map(|_| 1).unwrap_or(0) + e.batch.observations.len()
+            })
             .sum::<usize>() as u64;
 
         let res = match &db {
-            crate::state::DatabaseConnection::Postgres(pool) => {
-                write_batches(pool, default_project_id.as_ref(), batches)
-                    .await
-                    .map_err(|e| anyhow::anyhow!(e))
-            }
+            crate::state::DatabaseConnection::Postgres(pool) => write_envelopes(pool, envelopes)
+                .await
+                .map_err(|e| anyhow::anyhow!(e)),
             crate::state::DatabaseConnection::Memory(mem_db) => {
-                write_batches_to_memory(mem_db, default_project_id.as_ref(), batches)
+                write_envelopes_to_memory(mem_db, envelopes)
             }
         };
 
@@ -298,9 +311,7 @@ fn resolve_trace(
 ) -> ResolvedTrace {
     ResolvedTrace {
         id: trace.id,
-        project_id: trace
-            .projectId
-            .unwrap_or_else(|| default_project_id.to_string()),
+        project_id: default_project_id.to_string(),
         environment: trace.environment.unwrap_or_else(|| "default".to_string()),
         timestamp: trace.timestamp.unwrap_or(now),
         name: trace.name,
@@ -324,9 +335,7 @@ fn resolve_observation(obs: ObservationIngest, default_project_id: &str) -> Reso
     ResolvedObservation {
         id: obs.id,
         trace_id: obs.traceId,
-        project_id: obs
-            .projectId
-            .unwrap_or_else(|| default_project_id.to_string()),
+        project_id: default_project_id.to_string(),
         environment: obs.environment.unwrap_or_else(|| "default".to_string()),
         obs_type: obs.r#type.unwrap_or_else(|| "GENERATION".to_string()),
         name: obs.name,
@@ -752,5 +761,25 @@ fn write_batches_to_memory(
         mem_db.observations.insert(o.id, row);
     }
 
+    Ok(())
+}
+
+async fn write_envelopes(
+    pool: &PgPool,
+    envelopes: Vec<IngestEnvelope>,
+) -> Result<(), sqlx::Error> {
+    for envelope in envelopes {
+        write_batches(pool, &envelope.project_id, vec![envelope.batch]).await?;
+    }
+    Ok(())
+}
+
+fn write_envelopes_to_memory(
+    mem_db: &crate::state::MemoryDb,
+    envelopes: Vec<IngestEnvelope>,
+) -> Result<(), anyhow::Error> {
+    for envelope in envelopes {
+        write_batches_to_memory(mem_db, &envelope.project_id, vec![envelope.batch])?;
+    }
     Ok(())
 }

@@ -10,7 +10,10 @@ use base64::Engine;
 use chrono::Utc;
 
 use crate::{
-    http::common::ApiResponse,
+    http::{
+        auth_context::{is_write_route, AuthAccess, AuthContext, AuthRegistry},
+        common::ApiResponse,
+    },
     state::{mask_client_key, AppState},
 };
 
@@ -55,39 +58,65 @@ fn extract_client_key(headers: &HeaderMap) -> String {
     "anonymous".to_string()
 }
 
+fn resolve_auth_context(
+    registry: &AuthRegistry,
+    headers: &HeaderMap,
+) -> Option<AuthContext> {
+    match extract_auth(headers) {
+        Ok(AuthHeader::Bearer(token)) => registry.resolve_bearer(&token),
+        Ok(AuthHeader::Basic { username, password }) => {
+            registry.resolve_basic(&username, &password)
+        }
+        Err(()) => None,
+    }
+}
+
 pub(crate) async fn auth(
     State(state): State<AppState>,
     headers: HeaderMap,
-    request: axum::extract::Request,
+    mut request: axum::extract::Request,
     next: Next,
 ) -> impl IntoResponse {
     let path = request.uri().path();
+    let method = request.method().clone();
     let is_langfuse_compat = matches!(
         path,
         "/api/public/projects" | "/api/public/otel/v1/traces" | "/api/public/otel/v1/metrics"
     );
-    let langfuse_auth_not_configured =
-        state.langfuse_public_key.is_none() && state.langfuse_secret_key.is_none();
+    let langfuse_auth_not_configured = !state.auth_registry.has_basic_auth_configured()
+        && state.langfuse_public_key.is_none()
+        && state.langfuse_secret_key.is_none();
     let open_compat = state.allow_unauthenticated_compat && langfuse_auth_not_configured;
 
+    if let Some(ctx) = resolve_auth_context(&state.auth_registry, &headers) {
+        if is_write_route(&method, path) && ctx.access == AuthAccess::Read {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(ApiResponse::<serde_json::Value> {
+                    message: "read-only token cannot write".to_string(),
+                    code: Some("FORBIDDEN"),
+                    data: None,
+                }),
+            )
+                .into_response();
+        }
+        request.extensions_mut().insert(ctx);
+        return next.run(request).await;
+    }
+
     match extract_auth(&headers) {
-        Ok(AuthHeader::Bearer(token)) if token == state.api_bearer_token.as_ref() => {
+        Err(()) if is_langfuse_compat && open_compat => {
+            request.extensions_mut().insert(AuthContext {
+                project_id: state.auth_registry.default_project_id.clone(),
+                access: AuthAccess::Write,
+            });
             next.run(request).await
         }
-        Ok(AuthHeader::Basic { username, password })
-            if state
-                .langfuse_public_key
-                .as_deref()
-                .is_some_and(|k| k == username)
-                && state
-                    .langfuse_secret_key
-                    .as_deref()
-                    .is_some_and(|k| k == password) =>
-        {
-            next.run(request).await
-        }
-        Err(()) if is_langfuse_compat && open_compat => next.run(request).await,
         Ok(AuthHeader::Basic { .. }) if is_langfuse_compat && open_compat => {
+            request.extensions_mut().insert(AuthContext {
+                project_id: state.auth_registry.default_project_id.clone(),
+                access: AuthAccess::Write,
+            });
             next.run(request).await
         }
         _ => (

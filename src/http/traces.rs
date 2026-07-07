@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use crate::{
     http::{
+        auth_context::Authenticated,
         common::{PageMeta, PagedData},
         error::ApiError,
     },
@@ -255,6 +256,7 @@ fn parse_order_by(order_by: Option<&str>) -> Result<(&'static str, bool), ApiErr
 
 pub(crate) async fn get_traces(
     State(state): State<AppState>,
+    auth: Authenticated,
     Query(q): Query<TraceListQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     let page = q.page.unwrap_or(1).max(1);
@@ -263,7 +265,7 @@ pub(crate) async fn get_traces(
 
     let fields = parse_trace_fields(q.fields.as_deref());
     let (order_column, order_desc) = parse_order_by(q.order_by.as_deref())?;
-    let project_id = state.default_project_id.to_string();
+    let project_id = auth.project_id().to_string();
 
     match &state.db {
         crate::state::DatabaseConnection::Postgres(pool) => {
@@ -955,11 +957,12 @@ async fn resolve_json_value(
 
 pub(crate) async fn get_trace(
     State(state): State<AppState>,
+    auth: Authenticated,
     headers: axum::http::HeaderMap,
     Path(trace_id): Path<Uuid>,
     Query(query): Query<GetTraceQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let project_id = state.default_project_id.as_ref();
+    let project_id = auth.project_id();
     let resolve_media = query.resolve_media;
     let resolve_with = query.resolve_with;
     let public_base = media_public_base(&state, &headers);

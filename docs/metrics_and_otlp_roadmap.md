@@ -1,6 +1,6 @@
 # xtrace 指标能力与 OTLP metrics 实施路线（X0–X3）
 
-> **进度（截至 2026-07-06）**：**X0 已完成**（`POST /api/public/otel/v1/metrics`，PR #2 已合并）、**X1 已完成**（`count` 聚合 + 多 key `group_by` + `docs/api.md` 语义文档化，PR #3 已合并）、**X2-A 已完成**（cardinality governance，PR #5 已合并）。**X2-B 暂缓（单租户），X3 待做**。
+> **进度（截至 2026-07-07）**：**X0–X3 均已完成**。X0/X1 分别于 PR #2/#3 合并；X2-A（label governance）于 PR #5；X2-B（多 project token 鉴权）与 X3（TTL/降采样/读写 token/备份）于 2026-07-07 合入 main。
 
 > 背景：作为让上层 LLM 服务（如 Xinference/PowerLLM）**去 Langfuse 化**、由 xtrace 承接 trace + generation + 用量/成本 + LLM 业务指标的一部分，本文规划 xtrace 侧需要补齐/增强的能力。
 > 性质：**实施规划文档，本身不含代码改动。** 具体落地须按 `AGENTS.md`：改路由先读 `src/app.rs` 装配与 `src/http/`、`src/ingest/` 现有模式；DB 变更新增顺序 `migrations/` 并验证 `sqlx migrate`；合并前跑 `cargo fmt --all --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --all`。
@@ -50,20 +50,18 @@
 
 ---
 
-## X2 · 基数治理与多租户 — ✅ X2-A 已完成（PR #5）；⏸️ X2-B 暂缓（单租户）
-
-> 状态：✅ X2-A 已完成（PR #5）；⏸️ X2-B 暂缓（单租户）；X3 仍待做。
+## X2 · 基数治理与多租户 — ✅ 已完成（X2-A PR #5；X2-B 2026-07-07）
 
 - **高基数保护**（通用，非针对单一集成方）：ingest 侧对 label key 提供可配置白名单/维度上限与拒绝或丢弃策略；查询侧已有 `truncated` 元信息，补显式 series cap 与超限行为约定。防止 `metrics` 表序列爆炸（例如上层误把 `user_id`/`request_id` 放进 labels）。
-- **多租户**：schema 已具 `project_id`；若要支撑多部署/商业化，规划真正的多 project 鉴权与隔离(而非单默认项目)，保持与现有 BasicAuth/Bearer 兼容面不冲突。
+- **多租户**：`XTRACE_PROJECT_TOKENS=project:write_token[:read_token]` 与 `XTRACE_PROJECT_BASIC_AUTH=project:public:secret` 映射 Bearer/BasicAuth → `project_id`；所有读写 API 按 token 解析 project 并强制隔离（ingest 忽略客户端 `projectId` 覆盖）。
 
 ---
 
-## X3 · 自托管 / 商业化打磨
+## X3 · 自托管 / 商业化打磨 — ✅ 已完成（2026-07-07）
 
-- **数据保留 / TTL / 降采样**：为 `metrics`(及 traces/observations) 增加保留期与滚动降采样(长期存储成本);内存+JSON 模式补大小上限与淘汰。
-- **读写 token 分离**：区分只读查询 token 与写入 token(现 Bearer 写 + BasicAuth 读的基础上细化)。
-- **备份/迁移**：PostgreSQL 备份与 JSON 模式导入导出说明,补进 `README.md`/`docs/dev.md`。
+- **数据保留 / TTL / 降采样**：`METRICS_RETENTION_DAYS`、`TRACES_RETENTION_DAYS` 后台清理；`METRICS_DOWNSAMPLE_AFTER_DAYS` 对保留窗口内 raw points 做小时级 rollup；内存模式 `XTRACE_MEMORY_MAX_METRICS` / `XTRACE_MEMORY_MAX_TRACES` 容量淘汰。
+- **读写 token 分离**：`API_READ_BEARER_TOKEN` 只读访问 default project；写路由对 read token 返回 403。
+- **备份/迁移**：`scripts/backup_postgres.sh`（`pg_dump`）；JSON 模式仍由 `XTRACE_JSON_DIR` 目录直接拷贝。
 
 ---
 
@@ -86,5 +84,5 @@
 | X0 | OTLP metrics 摄入端点 + 映射到点模型 | 通用 | ✅ 已完成（PR #2） |
 | X1 | 查询聚合增强 + 语义文档化 | 通用 | ✅ 已完成（PR #3；`rate/increase` 暂缓） |
 | X2-A | 基数治理 | 通用 | ✅ 已完成（PR #5） |
-| X2-B | 多租户 | 通用 | ⏸️ 暂缓（单租户） |
-| X3 | 保留/降采样、token 分离、备份 | 通用 | ⏸️ 待做 |
+| X2-B | 多租户 | 通用 | ✅ 已完成（2026-07-07） |
+| X3 | 保留/降采样、token 分离、备份 | 通用 | ✅ 已完成（2026-07-07） |

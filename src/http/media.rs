@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    http::error::ApiError,
+    http::{auth_context::Authenticated, error::ApiError},
     media::{
         content_url, media_file_path, media_id_from_sha256_hash, upload_url, url_expiry_rfc3339,
     },
@@ -173,9 +173,11 @@ ON CONFLICT (id, project_id) DO UPDATE SET
 
 pub(crate) async fn post_media(
     State(state): State<AppState>,
+    auth: Authenticated,
     headers: HeaderMap,
     Json(body): Json<CreateMediaBody>,
 ) -> Result<impl IntoResponse, ApiError> {
+    auth.require_write()?;
     if body.sha256_hash.len() != 44 {
         return Err(ApiError::BadRequest(
             "sha256Hash must be a 44 character base64 encoded SHA-256 hash".into(),
@@ -188,7 +190,7 @@ pub(crate) async fn post_media(
         )));
     }
 
-    let project_id = state.default_project_id.as_ref();
+    let project_id = auth.project_id();
     let media_id = media_id_from_sha256_hash(&body.sha256_hash);
     let base = public_base_url(&state, &headers);
 
@@ -228,10 +230,11 @@ pub(crate) async fn post_media(
 
 pub(crate) async fn get_media(
     State(state): State<AppState>,
+    auth: Authenticated,
     headers: HeaderMap,
     Path(media_id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let project_id = state.default_project_id.as_ref();
+    let project_id = auth.project_id();
     let Some(row) = get_media_row(&state, project_id, &media_id).await? else {
         return Err(ApiError::NotFound);
     };
@@ -255,10 +258,12 @@ pub(crate) async fn get_media(
 
 pub(crate) async fn patch_media(
     State(state): State<AppState>,
+    auth: Authenticated,
     Path(media_id): Path<String>,
     Json(body): Json<PatchMediaBody>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let project_id = state.default_project_id.as_ref();
+    auth.require_write()?;
+    let project_id = auth.project_id();
     let Some(mut row) = get_media_row(&state, project_id, &media_id).await? else {
         return Err(ApiError::NotFound);
     };
@@ -271,11 +276,13 @@ pub(crate) async fn patch_media(
 
 pub(crate) async fn put_media_upload(
     State(state): State<AppState>,
+    auth: Authenticated,
     Path(media_id): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, ApiError> {
-    let project_id = state.default_project_id.as_ref();
+    auth.require_write()?;
+    let project_id = auth.project_id();
     let Some(row) = get_media_row(&state, project_id, &media_id).await? else {
         return Err(ApiError::NotFound);
     };
@@ -304,9 +311,10 @@ pub(crate) async fn put_media_upload(
 
 pub(crate) async fn get_media_content(
     State(state): State<AppState>,
+    auth: Authenticated,
     Path(media_id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let project_id = state.default_project_id.as_ref();
+    let project_id = auth.project_id();
     let Some(row) = get_media_row(&state, project_id, &media_id).await? else {
         return Err(ApiError::NotFound);
     };

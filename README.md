@@ -48,6 +48,17 @@ Environment variables:
 | `RATE_LIMIT_BURST` | | `40` | Per-token burst cap |
 | `XTRACE_ALLOW_UNAUTHENTICATED_COMPAT` | | unset (off) | Set to `1` only in dev: allow unauthenticated `GET /api/public/projects` and OTLP when Langfuse keys are not set. **Keep off in production.** |
 | `XTRACE_MAX_REQUEST_BODY_BYTES` | | `20971520` (20 MiB) | Max JSON body size for ingest routes |
+| `API_READ_BEARER_TOKEN` | | — | Read-only Bearer for queries on `DEFAULT_PROJECT_ID` |
+| `XTRACE_PROJECT_TOKENS` | | — | Multi-tenant map: `project:write_token[:read_token]` (comma-separated) |
+| `XTRACE_PROJECT_BASIC_AUTH` | | — | Multi-tenant BasicAuth: `project:public:secret` (comma-separated) |
+| `METRICS_RETENTION_DAYS` | | `0` (off) | Delete metrics older than N days |
+| `TRACES_RETENTION_DAYS` | | `0` (off) | Delete traces/observations older than N days |
+| `METRICS_DOWNSAMPLE_AFTER_DAYS` | | `0` (off) | Roll raw metrics to hourly buckets before retention cutoff |
+| `RETENTION_INTERVAL_HOURS` | | `24` | Background retention worker interval |
+| `XTRACE_MEMORY_MAX_METRICS` | | `0` (off) | Cap in-memory metric points (JSON mode) |
+| `XTRACE_MEMORY_MAX_TRACES` | | `0` (off) | Cap in-memory traces (JSON mode) |
+
+PostgreSQL backup: `DATABASE_URL=... scripts/backup_postgres.sh ./backups`
 
 Also accepts legacy names `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY`.
 
