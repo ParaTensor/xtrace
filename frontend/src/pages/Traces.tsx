@@ -25,7 +25,7 @@ export default function Traces() {
 
   const tracesQuery = useQuery({
     queryKey: ["traces"],
-    queryFn: fetchTraces,
+    queryFn: () => fetchTraces(50),
   });
 
   const traceDetailQuery = useQuery({
@@ -75,8 +75,18 @@ export default function Traces() {
               </div>
             ) : tracesQuery.isError ? (
               <div className="h-full flex items-center justify-center bg-card rounded-lg border border-border">
-                <div className="text-sm text-muted-foreground">
+                <div className="text-sm text-muted-foreground text-center px-4">
                   Failed to load traces. Please check API or Token.
+                  <div className="mt-1 text-xs opacity-80">
+                    {(tracesQuery.error as Error)?.message || "unknown error"}
+                  </div>
+                </div>
+              </div>
+            ) : traces.length === 0 ? (
+              <div className="h-full flex items-center justify-center bg-card rounded-lg border border-border">
+                <div className="text-center text-muted-foreground">
+                  <p className="text-lg">No traces yet</p>
+                  <p className="text-sm mt-1">Ingest data, then refresh this page</p>
                 </div>
               </div>
             ) : selectedTrace ? (

@@ -1,6 +1,6 @@
 use axum::{
     extract::State,
-    http::{header, HeaderMap, StatusCode},
+    http::{header, HeaderMap, Method, StatusCode},
     middleware::Next,
     response::IntoResponse,
     Json,
@@ -77,6 +77,11 @@ pub(crate) async fn auth(
     mut request: axum::extract::Request,
     next: Next,
 ) -> impl IntoResponse {
+    // CORS preflight has no Authorization; must not 401.
+    if request.method() == Method::OPTIONS {
+        return next.run(request).await;
+    }
+
     let path = request.uri().path();
     let method = request.method().clone();
     let is_langfuse_compat = matches!(
@@ -137,6 +142,10 @@ pub(crate) async fn rate_limit(
     request: axum::extract::Request,
     next: Next,
 ) -> axum::response::Response {
+    if request.method() == Method::OPTIONS {
+        return next.run(request).await;
+    }
+
     let key = extract_client_key(&headers);
 
     match state.query_limiter.check_key(&key) {

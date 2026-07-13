@@ -78,7 +78,38 @@ export type TraceListResponse = {
 
 export type TraceDetailResponse = TraceDetail;
 
-const DEFAULT_BASE_URL = "http://127.0.0.1:8742";
+export type MetricsOverviewRow = {
+  count_count: number;
+  avg_latency: number;
+  p95_latency: number;
+  p99_latency: number;
+  error_count: number;
+};
+
+export type MetricsOverviewResponse = {
+  data: MetricsOverviewRow[];
+};
+
+export type MetricsDailyItem = {
+  date: string;
+  countTraces?: number;
+  countObservations?: number;
+  totalCost?: number | null;
+  totalTokens?: number | null;
+  [key: string]: unknown;
+};
+
+export type MetricsDailyResponse = {
+  data: MetricsDailyItem[];
+  meta?: {
+    page: number;
+    limit: number;
+    totalItems: number;
+    totalPages: number;
+  };
+};
+
+const DEFAULT_BASE_URL = "http://127.0.0.1:3000";
 
 export const getBaseUrl = () =>
   import.meta.env.VITE_XTRACE_BASE_URL || DEFAULT_BASE_URL;
@@ -90,13 +121,19 @@ const buildHeaders = () => {
   return token ? { Authorization: `Bearer ${token}` } : {};
 };
 
-export async function fetchTraces() {
+export async function fetchTraces(limit = 50) {
   const baseUrl = getBaseUrl();
+  // Guard: react-query may pass QueryFunctionContext as the first argument when
+  // `queryFn: fetchTraces` is used directly — never stringify that into `limit=`.
+  const safeLimit =
+    typeof limit === "number" && Number.isFinite(limit)
+      ? Math.min(200, Math.max(1, Math.floor(limit)))
+      : 50;
   const response = await fetch(
-    `${baseUrl}/api/public/traces?page=1&limit=50&fields=core`,
+    `${baseUrl}/api/public/traces?page=1&limit=${safeLimit}&fields=core`,
     {
       headers: buildHeaders(),
-    }
+    },
   );
   if (!response.ok) {
     throw new Error(`Failed to load traces (${response.status})`);
@@ -116,4 +153,35 @@ export async function fetchTrace(traceId: string) {
     throw new Error(`Failed to load trace (${response.status})`);
   }
   return (await response.json()) as TraceDetailResponse;
+}
+
+/** Langfuse-compatible overview: GET /api/public/metrics?query=... */
+export async function fetchMetricsOverview(
+  view: "traces" | "observations" = "traces",
+) {
+  const baseUrl = getBaseUrl();
+  const query = JSON.stringify({
+    view,
+    metrics: [{ measure: "count", aggregation: "count" }],
+  });
+  const response = await fetch(
+    `${baseUrl}/api/public/metrics?query=${encodeURIComponent(query)}`,
+    { headers: buildHeaders() },
+  );
+  if (!response.ok) {
+    throw new Error(`Failed to load metrics overview (${response.status})`);
+  }
+  return (await response.json()) as MetricsOverviewResponse;
+}
+
+export async function fetchMetricsDaily(limit = 30) {
+  const baseUrl = getBaseUrl();
+  const response = await fetch(
+    `${baseUrl}/api/public/metrics/daily?page=1&limit=${limit}`,
+    { headers: buildHeaders() },
+  );
+  if (!response.ok) {
+    throw new Error(`Failed to load metrics daily (${response.status})`);
+  }
+  return (await response.json()) as MetricsDailyResponse;
 }

@@ -1,13 +1,17 @@
 use axum::{
     extract::DefaultBodyLimit,
+    http::{header, HeaderValue, Method},
     middleware::{self},
     routing::{get, post, put},
     Router,
 };
 use sqlx::postgres::PgPoolOptions;
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::sync::mpsc;
-use tower_http::trace::TraceLayer;
+use tower_http::{
+    cors::{AllowOrigin, CorsLayer},
+    trace::TraceLayer,
+};
 
 use crate::http::common::{healthz, readyz};
 use crate::http::{
@@ -27,6 +31,49 @@ use crate::ingest::otlp;
 use crate::metrics::label_governance::LabelGovernance;
 use crate::retention::retention_worker;
 use crate::state::{AppState, IngestStats, RateLimitStats, ServerConfig};
+
+/// Browser CORS for local dashboard / cross-origin clients.
+/// `XTRACE_CORS_ORIGINS`: comma-separated origins, or `*` for any (dev only).
+fn cors_layer() -> CorsLayer {
+    let raw = std::env::var("XTRACE_CORS_ORIGINS").unwrap_or_else(|_| {
+        "http://127.0.0.1:5173,http://localhost:5173".to_string()
+    });
+    let methods = [
+        Method::GET,
+        Method::POST,
+        Method::PUT,
+        Method::PATCH,
+        Method::DELETE,
+        Method::OPTIONS,
+        Method::HEAD,
+    ];
+    let headers = [
+        header::AUTHORIZATION,
+        header::CONTENT_TYPE,
+        header::ACCEPT,
+    ];
+
+    if raw.trim() == "*" {
+        return CorsLayer::new()
+            .allow_origin(AllowOrigin::any())
+            .allow_methods(methods)
+            .allow_headers(headers)
+            .max_age(Duration::from_secs(600));
+    }
+
+    let origins: Vec<HeaderValue> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| s.parse().ok())
+        .collect();
+
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::list(origins))
+        .allow_methods(methods)
+        .allow_headers(headers)
+        .max_age(Duration::from_secs(600))
+}
 
 /// Build the Axum router (used by the server and integration tests).
 pub fn build_router(state: AppState, max_body: usize) -> Router {
@@ -81,6 +128,7 @@ pub fn build_router(state: AppState, max_body: usize) -> Router {
         .merge(protected_routes)
         .layer(DefaultBodyLimit::max(max_body))
         .with_state(state)
+        .layer(cors_layer())
         .layer(TraceLayer::new_for_http())
 }
 
