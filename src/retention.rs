@@ -113,7 +113,8 @@ async fn run_postgres_retention(
     if config.metrics_downsample_after_days > 0
         && config.metrics_retention_days > config.metrics_downsample_after_days
     {
-        let downsample_cutoff = now - Duration::days(i64::from(config.metrics_downsample_after_days));
+        let downsample_cutoff =
+            now - Duration::days(i64::from(config.metrics_downsample_after_days));
         let retention_cutoff = now - Duration::days(i64::from(config.metrics_retention_days));
         let inserted = sqlx::query(
             r#"
@@ -194,10 +195,9 @@ fn run_memory_retention(
         if let Ok(mut metrics) = mem_db.metrics.lock() {
             let before = metrics.len();
             metrics.retain(|m| m.timestamp >= cutoff);
-            stats.metrics_deleted.fetch_add(
-                (before - metrics.len()) as u64,
-                Ordering::Relaxed,
-            );
+            stats
+                .metrics_deleted
+                .fetch_add((before - metrics.len()) as u64, Ordering::Relaxed);
         }
     }
 
@@ -256,7 +256,9 @@ fn run_memory_retention(
         let evict = entries.len() - config.memory_max_traces;
         for (trace_id, _) in entries.into_iter().take(evict) {
             mem_db.traces.remove(&trace_id);
-            mem_db.observations.retain(|_, obs| obs.trace_id != trace_id);
+            mem_db
+                .observations
+                .retain(|_, obs| obs.trace_id != trace_id);
         }
         stats
             .memory_traces_evicted

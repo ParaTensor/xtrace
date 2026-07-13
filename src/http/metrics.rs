@@ -8,9 +8,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sqlx::QueryBuilder;
-use std::{
-    collections::{BTreeMap, HashMap},
-};
+use std::collections::{BTreeMap, HashMap};
 use tokio::{sync::mpsc, time::Duration};
 
 use crate::{
