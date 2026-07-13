@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 use sqlx::postgres::PgPoolOptions;
 use tower::ServiceExt;
 use uuid::Uuid;
-use xtrace::test_app::{setup_mock_router, setup_mock_router_with_project_tokens, setup_mock_router_with_tokens, setup_test_router};
+use xtrace::test_app::{setup_mock_router, setup_mock_router_with_tokens, setup_test_router};
 
 async fn setup_app() -> (axum::Router, String) {
     let database_url =

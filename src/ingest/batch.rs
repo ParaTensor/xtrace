@@ -277,9 +277,7 @@ pub(crate) async fn ingest_worker(
 
         let item_count = envelopes
             .iter()
-            .map(|e| {
-                e.batch.trace.as_ref().map(|_| 1).unwrap_or(0) + e.batch.observations.len()
-            })
+            .map(|e| e.batch.trace.as_ref().map(|_| 1).unwrap_or(0) + e.batch.observations.len())
             .sum::<usize>() as u64;
 
         let res = match &db {
@@ -764,10 +762,7 @@ fn write_batches_to_memory(
     Ok(())
 }
 
-async fn write_envelopes(
-    pool: &PgPool,
-    envelopes: Vec<IngestEnvelope>,
-) -> Result<(), sqlx::Error> {
+async fn write_envelopes(pool: &PgPool, envelopes: Vec<IngestEnvelope>) -> Result<(), sqlx::Error> {
     for envelope in envelopes {
         write_batches(pool, &envelope.project_id, vec![envelope.batch]).await?;
     }
